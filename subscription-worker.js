@@ -1301,7 +1301,13 @@ const EASTMONEY_HOSTS = [
   "44.push2.eastmoney.com",
   "82.push2.eastmoney.com",
 ];
-const sectorBollingerKey = (bk) => `sector:bollinger:${bk}`;
+const SECTOR_DEFAULT_ADJUST = "qfq";
+const SECTOR_ADJUSTS = new Set(["qfq", "hfq", "none"]);
+// 默认参数保持旧 key，兼容既有 KV 缓存和 16:00 定时刷新；自定义参数用带参 key。
+const sectorBollingerKey = (bk, days = SECTOR_LOOKBACK_DAYS, adjust = SECTOR_DEFAULT_ADJUST) =>
+  days === SECTOR_LOOKBACK_DAYS && adjust === SECTOR_DEFAULT_ADJUST
+    ? `sector:bollinger:${bk}`
+    : `sector:bollinger:${bk}:${days}:${adjust}`;
 const sectorRankingKey = (bk) => `sector:ranking:${bk}`;
 
 function beijingDate(now = new Date()) {
@@ -1397,18 +1403,19 @@ async function fetchSectorRanking(env, bk, topN = SECTOR_TOP_N) {
   throw new Error(`暂时无法获取板块 ${bk} 成分股，请稍后重试`);
 }
 
-async function fetchSectorCloses(stock) {
+async function fetchSectorCloses(stock, days = SECTOR_LOOKBACK_DAYS, adjust = SECTOR_DEFAULT_ADJUST) {
   const symbol = `${stock.market === "1" ? "sh" : "sz"}${stock.code}`;
-  const param = `${symbol},day,,,${SECTOR_LOOKBACK_DAYS + 10},qfq`;
+  const fq = adjust === "none" ? "" : adjust;
+  const param = `${symbol},day,,,${days + 10},${fq}`;
   const payload = await fetchJsonWithRetry(
     `https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=${param}`,
     { headers: { Accept: "application/json,text/plain,*/*" } },
     `${stock.code} sector kline`
   );
   const obj = payload?.data?.[symbol] || {};
-  const rows = obj.qfqday || obj.day || [];
+  const rows = (fq && obj[`${fq}day`]) || obj.day || [];
   if (!rows.length) throw new Error(`${stock.code} 无K线数据`);
-  const bars = rows.slice(-SECTOR_LOOKBACK_DAYS);
+  const bars = rows.slice(-days);
   return {
     dates: bars.map((b) => String(b[0])),
     closes: bars.map((b) => Number(b[2])),
@@ -1421,13 +1428,15 @@ async function getBoardName(env, bk) {
   return hit?.name || bk;
 }
 
-async function refreshSectorBollinger(env, bk) {
+async function refreshSectorBollinger(env, bk, opts = {}) {
+  const days = opts.days || SECTOR_LOOKBACK_DAYS;
+  const adjust = SECTOR_ADJUSTS.has(opts.adjust) ? opts.adjust : SECTOR_DEFAULT_ADJUST;
   const { ranking, source: rankingSource } = await fetchSectorRanking(env, bk);
   // 单只个股拉不到（停牌/退市/新股）不应拖垮整个板块，逐只兜底为 null 再过滤。
   const enriched = (
     await mapWithConcurrency(ranking, 5, async (s) => {
       try {
-        const { dates, closes } = await fetchSectorCloses(s);
+        const { dates, closes } = await fetchSectorCloses(s, days, adjust);
         if (!closes.length) return null;
         return {
           code: `${s.market === "1" ? "sh" : "sz"}${s.code}`,
@@ -1449,7 +1458,9 @@ async function refreshSectorBollinger(env, bk) {
     updatedAt: new Date().toISOString(),
     bk,
     name: await getBoardName(env, bk),
-    source: `ranking=${rankingSource} + kline=tencent-qfq`,
+    days,
+    adjust,
+    source: `ranking=${rankingSource} + kline=tencent-${adjust}`,
     latestTradeDate: axis.dates[axis.dates.length - 1] || "",
     dates: axis.dates,
     stocks: enriched.map((s) => ({
@@ -1459,7 +1470,13 @@ async function refreshSectorBollinger(env, bk) {
       closes: s.closes,
     })),
   };
-  await env.SUBSCRIPTIONS.put(sectorBollingerKey(bk), JSON.stringify(payload));
+  const isDefault = days === SECTOR_LOOKBACK_DAYS && adjust === SECTOR_DEFAULT_ADJUST;
+  // 自定义参数的缓存加 TTL，避免长尾变体在 KV 里无限堆积
+  await env.SUBSCRIPTIONS.put(
+    sectorBollingerKey(bk, days, adjust),
+    JSON.stringify(payload),
+    isDefault ? undefined : { expirationTtl: 6 * 3600 }
+  );
   return payload;
 }
 
@@ -1468,12 +1485,18 @@ async function handleSectorBollinger(request, env) {
   let bk = String(url.searchParams.get("bk") || PCB_BK_CODE).toUpperCase();
   if (!SECTOR_BK_RE.test(bk)) bk = PCB_BK_CODE;
   const forceRefresh = url.searchParams.get("refresh") === "1";
+  const days =
+    normalizePeriod(url.searchParams.get("days") ?? url.searchParams.get("period"), SECTOR_LOOKBACK_DAYS) ||
+    SECTOR_LOOKBACK_DAYS;
+  const adjustRaw = String(url.searchParams.get("adjust") || SECTOR_DEFAULT_ADJUST).toLowerCase();
+  const adjust = SECTOR_ADJUSTS.has(adjustRaw) ? adjustRaw : SECTOR_DEFAULT_ADJUST;
+  const opts = { days, adjust };
   await touchTrackedSector(env, bk).catch(() => {});
-  if (forceRefresh) return json(await refreshSectorBollinger(env, bk));
-  const cached = safeJsonParse(await env.SUBSCRIPTIONS.get(sectorBollingerKey(bk)));
+  if (forceRefresh) return json(await refreshSectorBollinger(env, bk, opts));
+  const cached = safeJsonParse(await env.SUBSCRIPTIONS.get(sectorBollingerKey(bk, days, adjust)));
   if (cached?.stocks?.length) return json(cached);
-  // KV 无缓存（首次访问该板块），实时拉一次填充
-  return json(await refreshSectorBollinger(env, bk));
+  // KV 无缓存（首次访问该板块/该参数组合），实时拉一次填充
+  return json(await refreshSectorBollinger(env, bk, opts));
 }
 
 // 兼容旧入口：/api/pcb-bollinger === /api/sector-bollinger?bk=BK0877

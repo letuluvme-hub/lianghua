@@ -125,6 +125,38 @@ button { font-family: var(--font); }
 .dd-empty { padding: 12px; text-align: center; color: var(--ink-3); font-size: 12px; }
 @media (max-width: 720px) { .picker-search { margin-left: 0; max-width: none; } }
 
+/* === settings panel (参数设置) === */
+.settings-toggle {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 6px 12px; border-radius: 999px; cursor: pointer;
+  border: 1px solid var(--line); background: #fff; color: var(--ink-2);
+  font-size: 12px; font-weight: 600; font-family: var(--font); transition: all .12s;
+}
+.settings-toggle:hover { border-color: #c7d8ff; background: var(--brand-tint); }
+.settings-toggle.open { background: var(--brand); border-color: var(--brand); color: #fff; }
+.settings-panel {
+  display: none; width: 100%;
+  background: var(--surface); border-bottom: 1px solid var(--line);
+  padding: 10px 24px; align-items: flex-end; gap: 16px; flex-wrap: wrap;
+}
+.settings-panel.show { display: flex; }
+.settings-field { display: flex; flex-direction: column; gap: 4px; }
+.settings-field label { font-size: 11px; font-weight: 600; color: var(--ink-3); }
+.settings-field input, .settings-field select {
+  padding: 7px 10px; border-radius: var(--r-sm); border: 1px solid var(--line);
+  background: #fff; color: var(--ink); font-size: 13px; font-family: var(--font); min-width: 110px; box-sizing: border-box;
+}
+.settings-field input:focus, .settings-field select:focus {
+  outline: none; border-color: var(--brand); box-shadow: 0 0 0 3px rgba(43,98,224,.12);
+}
+.settings-apply {
+  border: none; background: var(--brand); color: #fff; padding: 8px 18px;
+  border-radius: var(--r-sm); font-size: 13px; font-weight: 600; font-family: var(--font); cursor: pointer;
+}
+.settings-apply:hover { background: var(--brand-strong); }
+.settings-apply:disabled { background: #94a3b8; cursor: wait; }
+.settings-hint { font-size: 11px; color: var(--ink-3); align-self: center; }
+
 /* === layout === */
 .shell { padding: 16px 24px 32px; width: 100%; margin: 0 auto; } /* 不设宽度上限，表格随窗口放大 */
 .layout { display: grid; grid-template-columns: minmax(0, 1.05fr) minmax(0, 1.45fr); gap: 16px; align-items: start; }
@@ -234,7 +266,7 @@ tbody tr.active td:first-child { box-shadow: inset 3px 0 0 var(--brand); }
     <div class="brand-mark">板</div>
     <div class="brand-text">
       <div class="t1" id="brand-name">板块布林带看板</div>
-      <div class="t2"><span id="brand-bk">选择或搜索板块</span> · 布林带 BOLL · N=20 · K=1/2/3</div>
+      <div class="t2"><span id="brand-bk">选择或搜索板块</span> · 布林带 BOLL · N=<span class="js-n">20</span> · K=1/2/3</div>
     </div>
   </div>
   <div class="spacer"></div>
@@ -253,6 +285,24 @@ tbody tr.active td:first-child { box-shadow: inset 3px 0 0 var(--brand); }
     <input id="board-search" type="text" placeholder="搜索板块加入自选（如：半导体材料 / CPO / 固态电池 / BK1036）…" autocomplete="off" />
     <div class="dropdown" id="board-dropdown"></div>
   </div>
+  <button class="settings-toggle" id="settings-toggle" onclick="toggleSettings()">⚙ 参数设置</button>
+</div>
+
+<div class="settings-panel" id="settings-panel">
+  <div class="settings-field">
+    <label for="set-days">周期 N（天数，2–250）</label>
+    <input id="set-days" type="number" min="2" max="250" step="1" />
+  </div>
+  <div class="settings-field">
+    <label for="set-adjust">复权</label>
+    <select id="set-adjust">
+      <option value="qfq">前复权</option>
+      <option value="hfq">后复权</option>
+      <option value="none">不复权</option>
+    </select>
+  </div>
+  <button class="settings-apply" id="settings-apply" onclick="applySettings()">应用</button>
+  <span class="settings-hint">中线/上下轨按最近 N 个交易日整体计算，与主页 BOLL(N) 一致；设置保存在本机浏览器。</span>
 </div>
 
 <div class="shell">
@@ -278,7 +328,7 @@ tbody tr.active td:first-child { box-shadow: inset 3px 0 0 var(--brand); }
         </div>
 
         <div class="stats-section">
-          <h3>布林带统计 BOLL(20)</h3>
+          <h3>布林带统计 BOLL(<span class="js-n">20</span>)</h3>
           <div class="stats-row" id="stats-row"></div>
         </div>
 
@@ -292,7 +342,7 @@ tbody tr.active td:first-child { box-shadow: inset 3px 0 0 var(--brand); }
 </div>
 
 <div class="foot">
-  公式：MA<sub>20</sub> = 20 日收盘均值；σ = 总体标准差；K=k 上轨 = MA + k·σ，下轨 = MA − k·σ。
+  公式：MA<sub class="js-n">20</sub> = <span class="js-n">20</span> 日收盘均值；σ = 总体标准差；K=k 上轨 = MA + k·σ，下轨 = MA − k·σ。
   中线日变动 = 今日 MID − 昨日 MID。%B = (Close − DN<sub>2</sub>) / (UP<sub>2</sub> − DN<sub>2</sub>)。
   数据源：东方财富板块成分（按流通市值降序取 Top20）+ 腾讯前复权日线；板块清单来自东财概念/行业板块，按当日涨幅（热度）排序。
 </div>
@@ -304,6 +354,55 @@ const API_BASE = "/api/sector-bollinger";
 const LIST_API = "/api/sector-list";
 const PICKS_KEY = "bollSectorPicks";
 const SEED_MAT_KEY = "bollSectorSeededMat";
+const SETTINGS_KEY = "bollSectorSettings";
+const DEFAULT_SETTINGS = { days: 20, adjust: "qfq" };
+const ADJUSTS = new Set(["qfq", "hfq", "none"]);
+
+function coerceDays(value) {
+  const n = Number(value);
+  return Number.isInteger(n) && n >= 2 && n <= 250 ? n : null;
+}
+function loadSettings() {
+  try {
+    const raw = JSON.parse(localStorage.getItem(SETTINGS_KEY)) || {};
+    return {
+      days: coerceDays(raw.days) || DEFAULT_SETTINGS.days,
+      adjust: ADJUSTS.has(raw.adjust) ? raw.adjust : DEFAULT_SETTINGS.adjust,
+    };
+  } catch { return { ...DEFAULT_SETTINGS }; }
+}
+function saveSettings(s) {
+  try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(s)); } catch {}
+}
+let SETTINGS = loadSettings();
+
+function toggleSettings() {
+  const panel = document.getElementById("settings-panel");
+  const btn = document.getElementById("settings-toggle");
+  const show = !panel.classList.contains("show");
+  panel.classList.toggle("show", show);
+  btn.classList.toggle("open", show);
+  if (show) syncSettingsInputs();
+}
+function syncSettingsInputs() {
+  document.getElementById("set-days").value = SETTINGS.days;
+  document.getElementById("set-adjust").value = SETTINGS.adjust;
+}
+async function applySettings() {
+  const days = coerceDays(document.getElementById("set-days").value);
+  if (days === null) { showToast("周期 N 需要是 2 到 250 之间的整数。", true); return; }
+  const adjust = document.getElementById("set-adjust").value;
+  SETTINGS = { days, adjust: ADJUSTS.has(adjust) ? adjust : DEFAULT_SETTINGS.adjust };
+  saveSettings(SETTINGS);
+  updateNLabels(SETTINGS.days);
+  const btn = document.getElementById("settings-apply");
+  btn.disabled = true; btn.textContent = "应用中…";
+  try { await loadData(true); }
+  finally { btn.disabled = false; btn.textContent = "应用"; }
+}
+function updateNLabels(n) {
+  document.querySelectorAll(".js-n").forEach((el) => { el.textContent = n; });
+}
 const DEFAULT_PICK = { bk: "BK0877", name: "PCB" };
 const BK_RE = /^BK\d{4,6}$/;
 
@@ -490,7 +589,7 @@ function selectBoard(bk, name) {
 async function loadData(force) {
   const btn = document.getElementById("refresh-btn");
   if (force) { btn.disabled = true; btn.textContent = "⟳ 刷新中…"; }
-  const base = `${API_BASE}?bk=${encodeURIComponent(currentBk)}`;
+  const base = `${API_BASE}?bk=${encodeURIComponent(currentBk)}&days=${SETTINGS.days}&adjust=${SETTINGS.adjust}`;
   const url = force ? `${base}&refresh=1&_t=${Date.now()}` : `${base}&_t=${Date.now()}`;
   try {
     const r = await fetch(url, { cache: "no-store" });
@@ -532,6 +631,7 @@ function applyData(data) {
     content.innerHTML = "";
     content.appendChild(document.getElementById("layout-tpl").content.cloneNode(true));
   }
+  updateNLabels(data.days || SETTINGS.days);
 
   rows = STOCKS.map(s => {
     const st = stats(s.closes);
@@ -550,7 +650,7 @@ function stats(closes) {
   const mean = closes.reduce((a,b)=>a+b,0)/n;
   const variance = closes.reduce((s,x)=>s+(x-mean)**2,0)/n;
   const std = Math.sqrt(variance);
-  // 中线日变动：今日 MA20 − 昨日 MA20；只有 20 个值时用近似（差异在小数点后 2~3 位）。
+  // 中线日变动：今日 MA_N − 昨日 MA_N；只有 N 个值时用近似（差异在小数点后 2~3 位）。
   const midPrev = (closes.slice(0, n-1).reduce((a,b)=>a+b,0) + closes[0]) / n;
   const midDelta = mean - midPrev;
   const last = closes[n-1], prev = closes[n-2] || last;
@@ -723,6 +823,8 @@ function init() {
   const cur = PICKS.find(p => p.bk === currentBk);
   setBrand(cur ? cur.name : currentBk, currentBk);
   renderPicks();
+  updateNLabels(SETTINGS.days);
+  syncSettingsInputs();
 
   const input = document.getElementById("board-search");
   input.addEventListener("focus", renderDropdown);
