@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>日布林带中线计算器</title>
+    <link rel="icon" href="data:," />
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div id="root"></div>
+
+    <!-- 自选板块看板入口（通用板块布林带，可搜索/自选东财全部热点板块；PCB 为默认自选之一，原 PCB 专版已并入） -->
+    <a
+      href="./sectors.html"
+      id="sectors-entry"
+      title="自选板块布林带看板 · 从东财全部热点板块任选（如 PCB / 半导体材料 / CPO / 固态电池）"
+      style="
+        position: fixed; top: 14px; right: 18px; z-index: 9999;
+        display: inline-flex; align-items: center; gap: 6px;
+        padding: 7px 14px; border-radius: 999px;
+        background: #0f9d76; color: #fff;
+        font: 600 12px/1 'PingFang SC','Microsoft YaHei',-apple-system,system-ui,sans-serif;
+        text-decoration: none; letter-spacing: .3px;
+        box-shadow: 0 4px 14px -4px rgba(15,157,118,.55), 0 1px 2px rgba(20,28,42,.08);
+        transition: transform .15s ease, box-shadow .15s ease, background .15s ease;
+      "
+      onmouseover="this.style.background='#0c7d5e';this.style.transform='translateY(-1px)';this.style.boxShadow='0 6px 18px -4px rgba(15,157,118,.7),0 1px 2px rgba(20,28,42,.1)';"
+      onmouseout="this.style.background='#0f9d76';this.style.transform='translateY(0)';this.style.boxShadow='0 4px 14px -4px rgba(15,157,118,.55),0 1px 2px rgba(20,28,42,.08)';"
+    >
+      <span style="display:inline-block;width:6px;height:6px;border-radius:50%;background:#a7f3d0;box-shadow:0 0 0 2px rgba(167,243,208,.35);"></span>
+      自选板块看板
+      <span style="opacity:.75;font-weight:400;">↗</span>
+    </a>
+
+    <script src="./vendor/react.production.min.js"></script>
+    <script src="./vendor/react-dom.production.min.js"></script>
+    <script src="./app.js"></script>
+  </body>
+</html>

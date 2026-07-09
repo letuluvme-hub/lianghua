@@ -1,0 +1,740 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>板块布林带看板 · 自选热点板块</title>
+<link rel="icon" href="data:,">
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<style>
+:root {
+  --font: "PingFang SC", "Microsoft YaHei", -apple-system, system-ui, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  --bg: #eceff4;
+  --surface: #ffffff;
+  --line: #e6eaf1;
+  --ink: #141a24;
+  --ink-2: #4a5570;
+  --ink-3: #6b7689;
+  --brand: #2b62e0;
+  --brand-strong: #1c4cc2;
+  --brand-tint: #eaf1ff;
+  --up: #138a55;
+  --down: #d63b34;
+  --ok-bg: #f0fdf4;
+  --c-price: #2b62e0;
+  --c-middle: #c2410c;
+  --c-k1: #16a34a;
+  --c-k2: #d97706;
+  --c-k3: #9333ea;
+  --r-sm: 7px;
+  --r-md: 9px;
+  --r-lg: 12px;
+  --sh-sm: 0 1px 2px rgba(20, 28, 42, 0.05);
+  --sh: 0 1px 2px rgba(20, 28, 42, 0.04), 0 8px 20px -12px rgba(20, 28, 42, 0.18);
+  color-scheme: light;
+  font-family: var(--font);
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; }
+body {
+  background: var(--bg); color: var(--ink); font-size: 14px;
+  min-height: 100vh; -webkit-font-smoothing: antialiased;
+}
+button { font-family: var(--font); }
+
+/* === top bar === */
+.topbar {
+  background: var(--surface); border-bottom: 1px solid var(--line);
+  padding: 14px 24px; display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+}
+.topbar .brand { display: flex; align-items: center; gap: 10px; }
+.topbar .brand-mark {
+  width: 32px; height: 32px; border-radius: 8px;
+  background: linear-gradient(135deg, #2b62e0, #1c4cc2);
+  color: #fff; font-weight: 800; font-size: 15px; letter-spacing: .5px;
+  display: flex; align-items: center; justify-content: center;
+}
+.topbar .brand-text { line-height: 1.2; }
+.topbar .brand-text .t1 { font-weight: 700; font-size: 15px; color: var(--ink); }
+.topbar .brand-text .t2 { font-size: 11px; color: var(--ink-3); margin-top: 2px; }
+.topbar .spacer { flex: 1; }
+.topbar .meta { display: flex; align-items: center; gap: 14px; font-size: 12px; color: var(--ink-3); flex-wrap: wrap; }
+.topbar .pill {
+  display: inline-flex; align-items: center; gap: 5px;
+  padding: 4px 10px; border-radius: 999px; font-size: 11px;
+  background: var(--ok-bg); color: #14724a; border: 1px solid #c2eecf;
+}
+.topbar .pill::before {
+  content: ""; width: 6px; height: 6px; border-radius: 50%; background: #16a34a;
+  box-shadow: 0 0 0 3px rgba(22,163,74,.18);
+}
+.topbar .back {
+  display: inline-flex; align-items: center; gap: 4px; padding: 6px 10px;
+  border-radius: var(--r-sm); border: 1px solid var(--line); background: #fff; color: var(--ink-2);
+  font-size: 12px; text-decoration: none;
+}
+.topbar .back:hover { background: var(--brand-tint); color: var(--brand-strong); border-color: #c7d8ff; }
+.topbar button.refresh {
+  border: none; background: var(--brand); color: #fff;
+  padding: 7px 14px; border-radius: var(--r-sm); font-size: 12px; font-weight: 600; cursor: pointer;
+  box-shadow: 0 4px 12px -4px rgba(43,98,224,.4);
+}
+.topbar button.refresh:hover { background: var(--brand-strong); }
+.topbar button.refresh:disabled { background: #94a3b8; cursor: wait; box-shadow: none; }
+
+/* === board picker bar === */
+.picker {
+  background: var(--surface); border-bottom: 1px solid var(--line);
+  padding: 10px 24px; display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+}
+.picker .picks { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.picker .picks-label { font-size: 12px; color: var(--ink-3); margin-right: 2px; }
+.chip {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 5px 8px 5px 12px; border-radius: 999px; cursor: pointer;
+  border: 1px solid var(--line); background: #fff; color: var(--ink-2);
+  font-size: 12px; font-weight: 600; font-family: var(--font); transition: all .12s;
+}
+.chip:hover { border-color: #c7d8ff; background: var(--brand-tint); }
+.chip.active { background: var(--brand); border-color: var(--brand); color: #fff; box-shadow: 0 4px 12px -4px rgba(43,98,224,.4); }
+.chip .chip-x { opacity: .6; font-weight: 700; font-size: 14px; line-height: 1; padding: 0 3px; border-radius: 50%; }
+.chip .chip-x:hover { opacity: 1; background: rgba(0,0,0,.12); }
+.chip.active .chip-x:hover { background: rgba(255,255,255,.25); }
+.picker-search { position: relative; flex: 1; min-width: 240px; max-width: 460px; margin-left: auto; }
+.picker-search input {
+  width: 100%; box-sizing: border-box; padding: 8px 12px; border-radius: var(--r-sm);
+  border: 1px solid var(--line); background: #fff; color: var(--ink); font-size: 13px; font-family: var(--font);
+}
+.picker-search input:focus { outline: none; border-color: var(--brand); box-shadow: 0 0 0 3px rgba(43,98,224,.12); }
+.dropdown {
+  position: absolute; top: calc(100% + 4px); left: 0; right: 0; z-index: 50;
+  background: #fff; border: 1px solid var(--line); border-radius: var(--r-md);
+  box-shadow: var(--sh); max-height: 340px; overflow: auto; display: none;
+}
+.dropdown.show { display: block; }
+.dd-row {
+  display: flex; align-items: center; gap: 8px; padding: 8px 12px; cursor: pointer;
+  border-bottom: 1px solid #f1f3f7; font-size: 13px;
+}
+.dd-row:last-child { border-bottom: none; }
+.dd-row:hover, .dd-row.hi { background: var(--brand-tint); }
+.dd-row .dd-name { font-weight: 600; color: var(--ink); }
+.dd-row .dd-bk { font-size: 11px; color: var(--ink-3); }
+.dd-row .dd-type { font-size: 10px; padding: 1px 6px; border-radius: 4px; background: #eef1f6; color: var(--ink-3); }
+.dd-row .dd-pct { margin-left: auto; font-variant-numeric: tabular-nums; font-weight: 600; }
+.dd-empty { padding: 12px; text-align: center; color: var(--ink-3); font-size: 12px; }
+@media (max-width: 720px) { .picker-search { margin-left: 0; max-width: none; } }
+
+/* === layout === */
+.shell { padding: 16px 24px 32px; width: 100%; margin: 0 auto; } /* 不设宽度上限，表格随窗口放大 */
+.layout { display: grid; grid-template-columns: minmax(0, 1.05fr) minmax(0, 1.45fr); gap: 16px; align-items: start; }
+@media (max-width: 1100px) { .layout { grid-template-columns: 1fr; } }
+
+.card {
+  background: var(--surface); border: 1px solid var(--line); border-radius: var(--r-lg);
+  box-shadow: var(--sh-sm); overflow: hidden;
+}
+.card-head {
+  padding: 12px 16px; border-bottom: 1px solid var(--line);
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+}
+.card-head h2 { margin: 0; font-size: 13px; font-weight: 600; color: var(--ink); }
+.card-head .sub { font-size: 11px; color: var(--ink-3); font-weight: 400; }
+
+/* === ranking table === */
+.tablewrap { max-height: calc(100vh - 240px); min-height: 420px; overflow: auto; } /* 高度随窗口自适应 */
+table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+thead th {
+  position: sticky; top: 0; background: #fafbfc; z-index: 1;
+  padding: 9px 8px; font-size: 11px; font-weight: 600; color: var(--ink-2);
+  border-bottom: 1px solid var(--line); text-align: right; white-space: nowrap;
+  cursor: pointer; user-select: none;
+}
+thead th:first-child, thead th.name, tbody td:first-child, tbody td.name { text-align: left; }
+thead th.sort-asc::after  { content: " ▲"; color: var(--brand); }
+thead th.sort-desc::after { content: " ▼"; color: var(--brand); }
+tbody td { padding: 9px 8px; font-size: 13px; border-bottom: 1px solid #f1f3f7; white-space: nowrap; }
+tbody tr { cursor: pointer; transition: background .12s; }
+tbody tr:hover { background: var(--brand-tint); }
+tbody tr.active { background: var(--brand-tint); }
+tbody tr.active td:first-child { box-shadow: inset 3px 0 0 var(--brand); }
+.stock-name { color: var(--ink); font-weight: 600; }
+.stock-code { color: var(--ink-3); font-size: 11px; margin-left: 6px; font-weight: 400; }
+.up { color: var(--up); }
+.down { color: var(--down); }
+.flat { color: var(--ink-3); }
+.tag { display: inline-block; padding: 1px 7px; border-radius: 4px; font-size: 11px; font-weight: 600; }
+.tag-up   { background: #fef2f2; color: #b91c1c; }
+.tag-down { background: #f0fdf4; color: #15803d; }
+.tag-mid  { background: var(--brand-tint); color: var(--brand-strong); }
+
+/* === right detail panel === */
+.detail-head { padding: 16px 18px 12px; border-bottom: 1px solid var(--line); }
+.detail-eyebrow { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--ink-3); }
+.detail-eyebrow .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--brand); }
+.detail-title { margin: 6px 0 4px; font-size: 28px; font-weight: 700; color: var(--ink); letter-spacing: -.3px; }
+.detail-title .code-suffix { color: var(--ink-3); font-weight: 500; font-size: 18px; margin-left: 10px; }
+.detail-sub { font-size: 12px; color: var(--ink-3); }
+.detail-sub .price { color: var(--ink); font-weight: 600; }
+
+.stats-section { padding: 16px 18px; }
+.stats-section h3 {
+  margin: 0 0 10px; font-size: 12px; font-weight: 600; color: var(--ink-3); letter-spacing: .3px;
+}
+.stats-row {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  gap: 8px;
+}
+@media (max-width: 1500px) { .stats-row { grid-template-columns: repeat(3, 1fr); } }
+@media (max-width: 720px)  { .stats-row { grid-template-columns: repeat(2, 1fr); } }
+.stat {
+  background: #f8fafc; border: 1px solid var(--line); border-radius: var(--r-md);
+  padding: 10px 12px;
+}
+.stat .k { font-size: 11px; color: var(--ink-3); font-weight: 500; }
+.stat .v { font-size: 18px; font-weight: 700; color: var(--ink); margin-top: 4px; font-variant-numeric: tabular-nums; line-height: 1.2; }
+.stat .v2 { font-size: 18px; font-weight: 700; color: var(--ink); font-variant-numeric: tabular-nums; line-height: 1.25; }
+.stat .v2 .lo { color: var(--down); }
+.stat .v2 .sep { color: var(--ink-3); margin: 0 2px; font-weight: 400; }
+.stat .v2 .hi { color: var(--up); }
+.stat.brand { background: var(--brand-tint); border-color: #c7d8ff; }
+.stat.brand .v { color: var(--brand-strong); }
+
+.chart-section { padding: 14px 16px 18px; }
+.chart-section .legend {
+  display: flex; gap: 14px; flex-wrap: wrap; margin: 0 0 10px;
+  font-size: 11px; color: var(--ink-2);
+}
+.chart-section .legend span { display: inline-flex; align-items: center; gap: 5px; }
+.chart-section .legend i {
+  display: inline-block; width: 16px; height: 2px; border-radius: 2px;
+}
+.chart-wrap { position: relative; height: 380px; }
+
+.empty { padding: 60px; text-align: center; color: var(--ink-3); font-size: 13px; }
+.spinner { display: inline-block; width: 14px; height: 14px; border: 2px solid #d1d5db; border-top-color: var(--brand); border-radius: 50%; animation: spin .8s linear infinite; vertical-align: middle; margin-right: 6px; }
+@keyframes spin { to { transform: rotate(360deg); } }
+
+.toast {
+  position: fixed; top: 18px; right: 18px; padding: 10px 14px; border-radius: 8px;
+  background: var(--ink); color: #fff; font-size: 12px; box-shadow: 0 6px 18px rgba(20,28,42,.2);
+  opacity: 0; transition: opacity .25s; pointer-events: none; z-index: 9999; max-width: 360px;
+}
+.toast.show { opacity: 1; }
+.toast.err { background: var(--down); }
+
+.foot { padding: 18px 24px 0; font-size: 11px; color: var(--ink-3); margin: 0 auto; }
+</style>
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <div class="brand-mark">板</div>
+    <div class="brand-text">
+      <div class="t1" id="brand-name">板块布林带看板</div>
+      <div class="t2"><span id="brand-bk">选择或搜索板块</span> · 布林带 BOLL · N=20 · K=1/2/3</div>
+    </div>
+  </div>
+  <div class="spacer"></div>
+  <div class="meta">
+    <span class="pill">工作日 16:00 自动刷新</span>
+    <span>区间 <span id="period">—</span></span>
+    <span>最后更新 <span id="updated">—</span></span>
+    <a href="./" class="back">← 返回主页</a>
+    <button class="refresh" id="refresh-btn" onclick="manualRefresh()">↻ 立即刷新</button>
+  </div>
+</header>
+
+<div class="picker">
+  <div class="picks" id="picks"></div>
+  <div class="picker-search">
+    <input id="board-search" type="text" placeholder="搜索板块加入自选（如：半导体材料 / CPO / 固态电池 / BK1036）…" autocomplete="off" />
+    <div class="dropdown" id="board-dropdown"></div>
+  </div>
+</div>
+
+<div class="shell">
+  <div id="content" class="card empty"><span class="spinner"></span>正在从服务器获取最新数据…</div>
+
+  <template id="layout-tpl">
+    <div class="layout">
+      <div class="card">
+        <div class="card-head">
+          <h2>排行表 <span class="sub">· 默认按区间排序</span></h2>
+          <span class="sub">点击列头排序，点击行查看详情</span>
+        </div>
+        <div class="tablewrap">
+          <table id="tbl"><thead><tr id="thead"></tr></thead><tbody id="tbody"></tbody></table>
+        </div>
+      </div>
+
+      <div class="card" id="detail">
+        <div class="detail-head">
+          <div class="detail-eyebrow"><span class="dot"></span><span id="d-market">—</span></div>
+          <div class="detail-title"><span id="d-name">—</span><span class="code-suffix" id="d-code"></span></div>
+          <div class="detail-sub" id="d-sub">—</div>
+        </div>
+
+        <div class="stats-section">
+          <h3>布林带统计 BOLL(20)</h3>
+          <div class="stats-row" id="stats-row"></div>
+        </div>
+
+        <div class="chart-section">
+          <div class="legend" id="chart-legend"></div>
+          <div class="chart-wrap"><canvas id="chart"></canvas></div>
+        </div>
+      </div>
+    </div>
+  </template>
+</div>
+
+<div class="foot">
+  公式：MA<sub>20</sub> = 20 日收盘均值；σ = 总体标准差；K=k 上轨 = MA + k·σ，下轨 = MA − k·σ。
+  中线日变动 = 今日 MID − 昨日 MID。%B = (Close − DN<sub>2</sub>) / (UP<sub>2</sub> − DN<sub>2</sub>)。
+  数据源：东方财富板块成分（按流通市值降序取 Top20）+ 腾讯前复权日线；板块清单来自东财概念/行业板块，按当日涨幅（热度）排序。
+</div>
+
+<div id="toast" class="toast"></div>
+
+<script>
+const API_BASE = "/api/sector-bollinger";
+const LIST_API = "/api/sector-list";
+const PICKS_KEY = "bollSectorPicks";
+const SEED_MAT_KEY = "bollSectorSeededMat";
+const DEFAULT_PICK = { bk: "BK0877", name: "PCB" };
+const BK_RE = /^BK\d{4,6}$/;
+
+let DATES = [], STOCKS = [], rows = [], chart = null, activeCode = null;
+let sortKey = "zoneIdx", sortDir = 1; // 默认按布林带区间排序（突破K3↑ → 突破K3↓），与主页“已选股票数据”一致
+let BOARDS = [];       // 全部板块清单 [{bk,name,type,pct}]
+let PICKS = [];        // 我的自选 [{bk,name}]
+let currentBk = "BK0877";
+let ddIndex = -1;      // 下拉高亮索引
+
+function showToast(msg, isError) {
+  const el = document.getElementById("toast");
+  el.textContent = msg;
+  el.className = "toast show" + (isError ? " err" : "");
+  setTimeout(() => { el.className = "toast" + (isError ? " err" : ""); }, 4500);
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+}
+
+function fmtDateTime(iso) {
+  if (!iso) return "—";
+  try {
+    const d = new Date(iso);
+    return new Intl.DateTimeFormat("zh-CN", {
+      timeZone: "Asia/Shanghai", year: "numeric", month: "2-digit", day: "2-digit",
+      hour: "2-digit", minute: "2-digit", hour12: false,
+    }).format(d).replace(/\//g, "-");
+  } catch { return iso; }
+}
+
+function fmtNum(v, d = 2) {
+  if (!Number.isFinite(v)) return "—";
+  return v.toLocaleString("en-US", { minimumFractionDigits: d, maximumFractionDigits: d });
+}
+
+function marketLabel(code) {
+  // sh / sz prefix
+  const p = code.slice(0, 2);
+  if (p === "sh") return "沪市";
+  if (p === "sz") return "深市";
+  return "";
+}
+
+/* ============ 自选（localStorage 持久化） ============ */
+function loadPicks() {
+  try {
+    const raw = JSON.parse(localStorage.getItem(PICKS_KEY) || "null");
+    if (Array.isArray(raw) && raw.length) {
+      const cleaned = raw.filter(p => p && BK_RE.test(p.bk)).map(p => ({ bk: p.bk, name: p.name || p.bk }));
+      if (cleaned.length) return cleaned;
+    }
+  } catch {}
+  return [{ ...DEFAULT_PICK }];
+}
+function savePicks() { try { localStorage.setItem(PICKS_KEY, JSON.stringify(PICKS)); } catch {} }
+function hasPick(bk) { return PICKS.some(p => p.bk === bk); }
+function addPick(bk, name, opts) {
+  opts = opts || {};
+  if (!BK_RE.test(bk)) return;
+  if (!hasPick(bk)) { PICKS.push({ bk, name: name || bk }); savePicks(); }
+  renderPicks();
+  if (opts.switchTo) selectBoard(bk, name);
+}
+function removePick(bk) {
+  PICKS = PICKS.filter(p => p.bk !== bk);
+  if (!PICKS.length) PICKS = [{ ...DEFAULT_PICK }];
+  savePicks();
+  if (currentBk === bk) selectBoard(PICKS[0].bk, PICKS[0].name);
+  else renderPicks();
+}
+
+function renderPicks() {
+  const wrap = document.getElementById("picks");
+  wrap.innerHTML = `<span class="picks-label">我的自选板块</span>` + PICKS.map(p =>
+    `<span class="chip ${p.bk === currentBk ? "active" : ""}" data-bk="${p.bk}">` +
+      `<span class="chip-name">${escapeHtml(p.name)}</span>` +
+      `<span class="chip-x" data-x="${p.bk}" title="移除">×</span>` +
+    `</span>`
+  ).join("");
+  wrap.querySelectorAll(".chip").forEach(el => {
+    el.addEventListener("click", (e) => {
+      const bk = el.dataset.bk;
+      if (e.target.dataset.x) { e.stopPropagation(); removePick(bk); return; }
+      const p = PICKS.find(x => x.bk === bk);
+      selectBoard(bk, p ? p.name : bk);
+    });
+  });
+}
+
+/* ============ 板块清单 + 搜索下拉 ============ */
+async function loadSectorList() {
+  try {
+    const r = await fetch(`${LIST_API}?_t=${Date.now()}`, { cache: "no-store" });
+    const data = await r.json();
+    BOARDS = Array.isArray(data.boards) ? data.boards : [];
+  } catch { BOARDS = []; }
+  reconcilePickNames();
+  seedMaterialsOnce();
+}
+function reconcilePickNames() {
+  if (!BOARDS.length) return;
+  const nameOf = new Map(BOARDS.map(b => [b.bk, b.name]));
+  let changed = false;
+  PICKS.forEach(p => { const n = nameOf.get(p.bk); if (n && n !== p.name) { p.name = n; changed = true; } });
+  if (changed) { savePicks(); renderPicks(); }
+  const cur = BOARDS.find(b => b.bk === currentBk);
+  if (cur) setBrand(cur.name, cur.bk);
+}
+function seedMaterialsOnce() {
+  if (!BOARDS.length) return; // 清单没加载成功就不标记“已尝试”，下次再试
+  if (localStorage.getItem(SEED_MAT_KEY) === "1") return;
+  const mat = BOARDS.find(b => b.name === "半导体材料") || BOARDS.find(b => b.name.includes("半导体材料"));
+  if (mat) addPick(mat.bk, mat.name);
+  localStorage.setItem(SEED_MAT_KEY, "1");
+}
+
+function filterBoards(q) {
+  q = q.trim().toLowerCase();
+  if (!q) return BOARDS.slice(0, 50);
+  return BOARDS.filter(b => b.name.toLowerCase().includes(q) || b.bk.toLowerCase().includes(q)).slice(0, 50);
+}
+function renderDropdown() {
+  const input = document.getElementById("board-search");
+  const dd = document.getElementById("board-dropdown");
+  const q = input.value;
+  ddIndex = -1;
+  if (!BOARDS.length) {
+    dd.innerHTML = `<div class="dd-empty">板块清单加载中或加载失败，可稍后重试；已有自选仍可使用</div>`;
+    dd.classList.add("show");
+    return;
+  }
+  const items = filterBoards(q);
+  let html = items.map((b, i) =>
+    `<div class="dd-row" data-bk="${b.bk}" data-name="${escapeHtml(b.name)}" data-i="${i}">` +
+      `<span class="dd-name">${escapeHtml(b.name)}</span>` +
+      `<span class="dd-bk">${b.bk}</span>` +
+      `<span class="dd-type">${b.type === "industry" ? "行业" : "概念"}</span>` +
+      `<span class="dd-pct ${b.pct > 0 ? "up" : b.pct < 0 ? "down" : "flat"}">${b.pct > 0 ? "+" : ""}${b.pct.toFixed(2)}%</span>` +
+    `</div>`
+  ).join("");
+  const upper = q.trim().toUpperCase();
+  if (BK_RE.test(upper) && !items.some(b => b.bk === upper)) {
+    html = `<div class="dd-row" data-bk="${upper}" data-name="${upper}" data-i="-1">` +
+      `<span class="dd-name">加入代码 ${upper}</span><span class="dd-bk">手动</span></div>` + html;
+  }
+  dd.innerHTML = html || `<div class="dd-empty">无匹配板块</div>`;
+  dd.classList.add("show");
+  dd.querySelectorAll(".dd-row").forEach(row => {
+    row.addEventListener("mousedown", (e) => { e.preventDefault(); pickFromDropdown(row.dataset.bk, row.dataset.name); });
+  });
+}
+function pickFromDropdown(bk, name) {
+  document.getElementById("board-search").value = "";
+  hideDropdown();
+  addPick(bk, name, { switchTo: true });
+}
+function hideDropdown() { document.getElementById("board-dropdown").classList.remove("show"); }
+function onSearchKey(e) {
+  const dd = document.getElementById("board-dropdown");
+  const list = [...dd.querySelectorAll(".dd-row")];
+  if (e.key === "ArrowDown") { e.preventDefault(); ddIndex = Math.min(ddIndex + 1, list.length - 1); paintHi(list); }
+  else if (e.key === "ArrowUp") { e.preventDefault(); ddIndex = Math.max(ddIndex - 1, 0); paintHi(list); }
+  else if (e.key === "Enter") { const row = list[ddIndex] || list[0]; if (row) { e.preventDefault(); pickFromDropdown(row.dataset.bk, row.dataset.name); } }
+  else if (e.key === "Escape") { hideDropdown(); }
+}
+function paintHi(list) { list.forEach((r, i) => r.classList.toggle("hi", i === ddIndex)); if (list[ddIndex]) list[ddIndex].scrollIntoView({ block: "nearest" }); }
+
+/* ============ 选择并加载某板块 ============ */
+function setBrand(name, bk) {
+  document.getElementById("brand-name").textContent = name || bk || "板块布林带看板";
+  document.getElementById("brand-bk").textContent = bk ? `板块 ${bk}` : "";
+}
+function selectBoard(bk, name) {
+  if (!BK_RE.test(bk)) return;
+  currentBk = bk;
+  setBrand(name, bk);
+  renderPicks();
+  activeCode = null; // 换板块后重置选中股，改选新板块第一只
+  loadData(false);
+}
+
+async function loadData(force) {
+  const btn = document.getElementById("refresh-btn");
+  if (force) { btn.disabled = true; btn.textContent = "⟳ 刷新中…"; }
+  const base = `${API_BASE}?bk=${encodeURIComponent(currentBk)}`;
+  const url = force ? `${base}&refresh=1&_t=${Date.now()}` : `${base}&_t=${Date.now()}`;
+  try {
+    const r = await fetch(url, { cache: "no-store" });
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    const data = await r.json();
+    if (data.error) throw new Error(data.error);
+    applyData(data);
+    if (force) showToast("已刷新到最新数据：" + (data.latestTradeDate || ""));
+  } catch (e) {
+    if (document.getElementById("tbl")) {
+      // 看板已渲染：加载失败只弹提示，保留现有数据，不整页覆盖成错误信息。
+      showToast("加载失败：" + e.message, true);
+      return;
+    }
+    const content = document.getElementById("content");
+    content.className = "card empty";
+    content.innerHTML =
+      `<div style="color:var(--down)">加载失败：${escapeHtml(e.message)}<br><br>` +
+      `<button class="refresh" onclick="loadData(false)" style="border:none;background:var(--brand);color:#fff;padding:8px 16px;border-radius:7px;cursor:pointer;">重试</button></div>`;
+    showToast("加载失败：" + e.message, true);
+  } finally {
+    if (force) { btn.disabled = false; btn.textContent = "↻ 立即刷新"; }
+  }
+}
+
+async function manualRefresh() { await loadData(true); }
+
+function applyData(data) {
+  DATES = data.dates || [];
+  STOCKS = data.stocks || [];
+  if (data.name) setBrand(data.name, data.bk || currentBk);
+  document.getElementById("period").textContent =
+    DATES.length ? `${DATES[0]} ~ ${DATES[DATES.length-1]} · ${DATES.length} 个交易日` : "无数据";
+  document.getElementById("updated").textContent = fmtDateTime(data.updatedAt);
+
+  const content = document.getElementById("content");
+  if (!document.getElementById("tbl")) {
+    content.classList.remove("empty", "card");
+    content.innerHTML = "";
+    content.appendChild(document.getElementById("layout-tpl").content.cloneNode(true));
+  }
+
+  rows = STOCKS.map(s => {
+    const st = stats(s.closes);
+    st.zone = classifyCloseZone(st.last, st.mean, st.k1u, st.k1d, st.k2u, st.k2d, st.k3u, st.k3d);
+    st.zoneIdx = st.zone.idx; // 供“区间”列排序
+    return { ...s, ...st };
+  });
+  renderTable();
+  if (rows.length) selectStock(activeCode && rows.find(r => r.code === activeCode) ? activeCode : rows[0].code);
+  else document.getElementById("d-name").textContent = "该板块暂无数据";
+}
+
+function stats(closes) {
+  const n = closes.length;
+  if (!n) return { mean:0, std:0, last:0, prev:0, pct:0, midPrev:0, midDelta:0, k1u:0,k1d:0,k2u:0,k2d:0,k3u:0,k3d:0, pctB:0 };
+  const mean = closes.reduce((a,b)=>a+b,0)/n;
+  const variance = closes.reduce((s,x)=>s+(x-mean)**2,0)/n;
+  const std = Math.sqrt(variance);
+  // 中线日变动：今日 MA20 − 昨日 MA20；只有 20 个值时用近似（差异在小数点后 2~3 位）。
+  const midPrev = (closes.slice(0, n-1).reduce((a,b)=>a+b,0) + closes[0]) / n;
+  const midDelta = mean - midPrev;
+  const last = closes[n-1], prev = closes[n-2] || last;
+  const pct = prev ? ((last/prev)-1)*100 : 0;
+  return {
+    mean, std, last, prev, pct, midDelta,
+    k1u: mean + std,   k1d: mean - std,
+    k2u: mean + 2*std, k2d: mean - 2*std,
+    k3u: mean + 3*std, k3d: mean - 3*std,
+    pctB: (2*std === 0) ? 0 : (last - (mean - 2*std)) / (4*std),
+  };
+}
+
+function classifyCloseZone(close, mean, k1u, k1d, k2u, k2d, k3u, k3d) {
+  if (close > k3u) return { label: "突破K3↑", cls: "up", idx: 0 };
+  if (close > k2u) return { label: "K2-K3↑", cls: "up", idx: 1 };
+  if (close > k1u) return { label: "K1-K2↑", cls: "up", idx: 2 };
+  if (close > mean) return { label: "中-K1↑", cls: "up", idx: 3 };
+  if (close > k1d) return { label: "K1-中↓", cls: "down", idx: 4 };
+  if (close > k2d) return { label: "K2-K1↓", cls: "down", idx: 5 };
+  if (close > k3d) return { label: "K3-K2↓", cls: "down", idx: 6 };
+  return { label: "突破K3↓", cls: "down", idx: 7 };
+}
+
+// sortKey：排序时实际读取的行字段（close→last、zone→zoneIdx、k1/k2/k3→上轨值）；null 表示该列不可排序。
+const COLS = [
+  { k:"name",  t:"股票",     sortKey:"name",    fmt:(v,r)=>`<span class="stock-name">${r.name}</span><span class="stock-code">${r.code}</span>` },
+  { k:"date",  t:"日期",     sortKey:null,      fmt:()=> DATES.length ? DATES[DATES.length-1] : "—" },
+  { k:"close", t:"收盘",     sortKey:"last",    fmt:(v,r)=>`<span class="${r.pct>0?'up':r.pct<0?'down':'flat'}">${fmtNum(r.last,2)}</span>` },
+  { k:"zone",  t:"区间",     sortKey:"zoneIdx", fmt:(v,r)=> r.zone ? `<span class="tag ${r.zone.cls==='up'?'tag-up':'tag-down'}">${r.zone.label}</span>` : "—" },
+  { k:"mean",  t:"中线",     sortKey:"mean",    fmt:v=>fmtNum(v,2) },
+  { k:"std",   t:"标准差",   sortKey:"std",     fmt:v=>fmtNum(v,2) },
+  { k:"k1",    t:"K1上/下",  sortKey:"k1u",     fmt:(v,r)=>`<span class="up">${fmtNum(r.k1u,2)}</span> / <span class="down">${fmtNum(r.k1d,2)}</span>` },
+  { k:"k2",    t:"K2上/下",  sortKey:"k2u",     fmt:(v,r)=>`<span class="up">${fmtNum(r.k2u,2)}</span> / <span class="down">${fmtNum(r.k2d,2)}</span>` },
+  { k:"k3",    t:"K3上/下",  sortKey:"k3u",     fmt:(v,r)=>`<span class="up">${fmtNum(r.k3u,2)}</span> / <span class="down">${fmtNum(r.k3d,2)}</span>` },
+  { k:"chart", t:"查看",     sortKey:null,      fmt:(v,r)=>`<button onclick="event.stopPropagation();selectStock('${r.code}')" style="border:none;background:var(--brand);color:#fff;padding:3px 10px;border-radius:4px;font-size:11px;cursor:pointer;">查看</button>` },
+];
+
+function renderTable() {
+  rows.sort((a,b)=>{
+    const ak = a[sortKey], bk = b[sortKey];
+    if (typeof ak === "string") return sortDir * ak.localeCompare(bk);
+    return sortDir * ((Number(ak) || 0) - (Number(bk) || 0));
+  });
+  const thead = document.getElementById("thead");
+  thead.innerHTML = COLS.map(c => {
+    const k = c.sortKey;
+    const cls = (k && sortKey === k) ? (sortDir === 1 ? "sort-asc" : "sort-desc") : "";
+    return `<th class="${cls} ${c.k==='name'?'name':''}" ${k ? `data-key="${k}"` : ""} ${k ? "" : 'style="cursor:default"'}>${c.t}</th>`;
+  }).join("");
+  thead.querySelectorAll("th").forEach(th => {
+    th.onclick = () => {
+      const k = th.dataset.key;
+      if (!k) return; // 日期 / 查看 列不参与排序
+      if (sortKey === k) sortDir = -sortDir; else { sortKey = k; sortDir = -1; }
+      renderTable();
+    };
+  });
+  const tbody = document.getElementById("tbody");
+  tbody.innerHTML = rows.map(r =>
+    `<tr data-code="${r.code}">` + COLS.map(c => {
+      const cls = c.k === "name" ? "name" : "";
+      return `<td class="${cls}">${c.fmt(r[c.k], r)}</td>`;
+    }).join("") + `</tr>`
+  ).join("");
+  tbody.querySelectorAll("tr").forEach(tr => tr.onclick = () => selectStock(tr.dataset.code));
+  highlightActive();
+}
+
+function selectStock(code) {
+  activeCode = code;
+  const r = rows.find(x => x.code === code);
+  if (!r) return;
+
+  document.getElementById("d-market").textContent = `${marketLabel(r.code)} · 流通市值 ${fmtNum(r.mcap, 2)} 亿`;
+  document.getElementById("d-name").textContent = r.name;
+  document.getElementById("d-code").textContent = r.code;
+
+  const lastDate = DATES[DATES.length-1];
+  const pctSpan = `<span class="${r.pct>0?'up':r.pct<0?'down':'flat'}">${r.pct>0?'+':''}${r.pct.toFixed(2)}%</span>`;
+  document.getElementById("d-sub").innerHTML =
+    `${lastDate} 最新价 <span class="price">${fmtNum(r.last,2)}</span> · 较昨 ${pctSpan} · 数据周期 ${DATES.length} 个交易日`;
+
+  const deltaCls = r.midDelta > 0 ? "up" : r.midDelta < 0 ? "down" : "flat";
+  document.getElementById("stats-row").innerHTML = `
+    <div class="stat brand"><div class="k">MID · 中线</div><div class="v">${fmtNum(r.mean,2)}</div></div>
+    <div class="stat"><div class="k">σ · 标准差</div><div class="v">${fmtNum(r.std,2)}</div></div>
+    <div class="stat"><div class="k">K=1 上 / 下</div><div class="v2"><span class="hi">${fmtNum(r.k1u,2)}</span><div class="sep">/</div><span class="lo">${fmtNum(r.k1d,2)}</span></div></div>
+    <div class="stat"><div class="k">K=2 上 / 下</div><div class="v2"><span class="hi">${fmtNum(r.k2u,2)}</span><div class="sep">/</div><span class="lo">${fmtNum(r.k2d,2)}</span></div></div>
+    <div class="stat"><div class="k">K=3 上 / 下</div><div class="v2"><span class="hi">${fmtNum(r.k3u,2)}</span><div class="sep">/</div><span class="lo">${fmtNum(r.k3d,2)}</span></div></div>
+    <div class="stat"><div class="k">中线日变动</div><div class="v ${deltaCls}">${r.midDelta>0?'+':''}${fmtNum(r.midDelta,2)}</div></div>
+  `;
+
+  // expanding-window bands for chart
+  const closes = r.closes;
+  const expandMean = i => { const w = closes.slice(0,i+1); return w.reduce((a,b)=>a+b,0)/w.length; };
+  const expandStd  = (i,m) => { const w = closes.slice(0,i+1); const v = w.reduce((s,x)=>s+(x-m)**2,0)/w.length; return Math.sqrt(v); };
+  const mids = closes.map((_,i)=> expandMean(i));
+  const k1u = closes.map((_,i)=> { const m=expandMean(i); return m + expandStd(i,m); });
+  const k1d = closes.map((_,i)=> { const m=expandMean(i); return m - expandStd(i,m); });
+  const k2u = closes.map((_,i)=> { const m=expandMean(i); return m + 2*expandStd(i,m); });
+  const k2d = closes.map((_,i)=> { const m=expandMean(i); return m - 2*expandStd(i,m); });
+  const k3u = closes.map((_,i)=> { const m=expandMean(i); return m + 3*expandStd(i,m); });
+  const k3d = closes.map((_,i)=> { const m=expandMean(i); return m - 3*expandStd(i,m); });
+
+  document.getElementById("chart-legend").innerHTML = `
+    <span><i style="background:var(--c-price)"></i>收盘价</span>
+    <span><i style="background:var(--c-middle)"></i>中轨 MID</span>
+    <span><i style="background:var(--c-k1)"></i>±1σ (K=1)</span>
+    <span><i style="background:var(--c-k2)"></i>±2σ (K=2)</span>
+    <span><i style="background:var(--c-k3)"></i>±3σ (K=3)</span>
+  `;
+
+  if (chart) chart.destroy();
+  const dashed = [3,3], dotted = [1,3];
+  chart = new Chart(document.getElementById("chart"), {
+    type: "line",
+    data: {
+      labels: DATES,
+      datasets: [
+        { label:"K3上", data:k3u, borderColor:"#9333ea", borderWidth:1, pointRadius:0, borderDash:dotted },
+        { label:"K2上", data:k2u, borderColor:"#d97706", borderWidth:1, pointRadius:0, borderDash:dashed },
+        { label:"K1上", data:k1u, borderColor:"#16a34a", borderWidth:1, pointRadius:0 },
+        { label:"MID",  data:mids, borderColor:"#c2410c", borderWidth:1.8, pointRadius:0 },
+        { label:"K1下", data:k1d, borderColor:"#16a34a", borderWidth:1, pointRadius:0 },
+        { label:"K2下", data:k2d, borderColor:"#d97706", borderWidth:1, pointRadius:0, borderDash:dashed },
+        { label:"K3下", data:k3d, borderColor:"#9333ea", borderWidth:1, pointRadius:0, borderDash:dotted },
+        { label:"收盘", data:closes, borderColor:"#2b62e0", backgroundColor:"#2b62e0", borderWidth:2.2, pointRadius:2.5, tension:0.15 },
+      ]
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      interaction: { mode: "index", intersect: false },
+      plugins: {
+        legend: { display: false },
+        tooltip: {
+          mode: "index", intersect: false, backgroundColor: "rgba(20,28,42,.92)",
+          titleFont: { size: 11, weight: 600 }, bodyFont: { size: 11 },
+          itemSort: (a,b)=> b.parsed.y - a.parsed.y,
+        }
+      },
+      scales: {
+        x: { ticks: { autoSkip: true, maxTicksLimit: 8, font: { size: 10, family: 'var(--font)' }, color: '#6b7689' }, grid: { color: "#f1f3f7" } },
+        y: { ticks: { font: { size: 10, family: 'var(--font)' }, color: '#6b7689' }, grid: { color: "#f1f3f7" } },
+      }
+    }
+  });
+
+  highlightActive();
+}
+
+function highlightActive() {
+  document.querySelectorAll("#tbody tr").forEach(tr => {
+    tr.classList.toggle("active", tr.dataset.code === activeCode);
+  });
+}
+
+/* ============ 初始化 ============ */
+function init() {
+  PICKS = loadPicks();
+  const urlBk = new URLSearchParams(location.search).get("bk");
+  if (urlBk && BK_RE.test(urlBk.toUpperCase())) {
+    const bk = urlBk.toUpperCase();
+    if (!hasPick(bk)) PICKS.unshift({ bk, name: bk });
+    currentBk = bk;
+  } else {
+    currentBk = PICKS[0].bk;
+  }
+  savePicks();
+  const cur = PICKS.find(p => p.bk === currentBk);
+  setBrand(cur ? cur.name : currentBk, currentBk);
+  renderPicks();
+
+  const input = document.getElementById("board-search");
+  input.addEventListener("focus", renderDropdown);
+  input.addEventListener("input", renderDropdown);
+  input.addEventListener("keydown", onSearchKey);
+  document.addEventListener("click", (e) => { if (!e.target.closest(".picker-search")) hideDropdown(); });
+
+  loadData(false);      // 先出当前板块数据
+  loadSectorList();     // 异步补全清单/名称/首次自动加入“半导体材料”
+}
+
+init();
+</script>
+</body>
+</html>

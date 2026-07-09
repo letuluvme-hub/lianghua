@@ -1,0 +1,7 @@
+# Secrets — 绝对不要提交（含 Cloudflare API 令牌）
+.env
+.env.*
+*.env
+
+# 依赖目录（如果以后用到）
+node_modules/

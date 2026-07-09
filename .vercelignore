@@ -1,0 +1,10 @@
+preview.png
+server.out.log
+server.err.log
+server.js
+verify.js
+subscription-worker.js
+cloudflared.exe
+cloudflared.out.log
+cloudflared.err.log
+audit
