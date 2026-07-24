@@ -2,6 +2,8 @@
   const { useEffect, useMemo, useRef, useState } = React;
 
   const BAND_MULTIPLIERS = [1, 2, 3];
+  // 图表 / 明细只展示最近 N 个交易日的布林带（布林带本身仍按完整周期在更早的数据上计算）。
+  const DISPLAY_RECENT_DAYS = 20;
   const API_BASE = window.BOLL_ALERT_API_URL || "https://cambricon-boll-midline.pages.dev";
   const AUTH_STORAGE_KEY = "bollAuthSession";
   const CUSTOM_GROUPS_STORAGE_KEY = "bollCustomGroups";
@@ -123,7 +125,7 @@
       marketMode: "auto",
       startDate: toDateInputValue(start),
       endDate: toDateInputValue(end),
-      period: 20,
+      period: 40,
       adjust: "1",
     };
   }
@@ -1139,7 +1141,11 @@
     const activePeriod = coercePeriod(form.period);
     const computedRows = useMemo(() => computeBollingerBands(rows, activePeriod), [rows, activePeriod]);
     const displayRows = useMemo(
-      () => computedRows.filter((row) => (!form.startDate || row.date >= form.startDate) && (!form.endDate || row.date <= form.endDate)),
+      () => {
+        const inRange = computedRows.filter((row) => (!form.startDate || row.date >= form.startDate) && (!form.endDate || row.date <= form.endDate));
+        // 只保留最近 DISPLAY_RECENT_DAYS 个交易日用于展示，布林带已在更早的数据上按完整周期算好。
+        return DISPLAY_RECENT_DAYS > 0 ? inRange.slice(-DISPLAY_RECENT_DAYS) : inRange;
+      },
       [computedRows, form.startDate, form.endDate]
     );
     const customGroupMap = useMemo(() => {
