@@ -125,7 +125,7 @@
       marketMode: "auto",
       startDate: toDateInputValue(start),
       endDate: toDateInputValue(end),
-      period: 40,
+      period: 20,
       adjust: "1",
     };
   }
