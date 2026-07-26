@@ -360,6 +360,7 @@ tbody tr.active td:first-child { box-shadow: inset 3px 0 0 var(--brand); }
   数据源：东方财富板块成分（按流通市值降序取 Top20）+ 腾讯前复权日线；板块清单来自东财概念/行业板块，按当日涨幅（热度）排序。
   「主线股票」为虚拟板块：每日自动取当日涨幅居前的概念板块（剔除融资融券/破净/昨日涨停等风格类板块），各取涨幅前 3 的成分股去重合成，
   并剔除 ST、退市与北交所标的、流通市值低于 30 亿的微盘股。
+  「我的主线」同为虚拟板块，但成分是手工维护的固定名单（按题材分组，在 Worker 代码里改），不随当日热度变化。
 </div>
 
 <div id="toast" class="toast"></div>
@@ -369,7 +370,8 @@ const API_BASE = "/api/sector-bollinger";
 const LIST_API = "/api/sector-list";
 const PICKS_KEY = "bollSectorPicks";
 const SEED_MAT_KEY = "bollSectorSeededMat";
-const SEED_MAINLINE_KEY = "bollSectorSeededMainline";
+// 版本号跟着 VIRTUAL_BOARDS 走：加了新的虚拟板块就 +1，否则老用户的标记已是 "1"，永远补不上
+const SEED_VIRTUAL_KEY = "bollSectorSeededVirtual2";
 const SETTINGS_KEY = "bollSectorSettings";
 const DEFAULT_SETTINGS = { days: 20, adjust: "qfq" };
 const ADJUSTS = new Set(["qfq", "hfq", "none"]);
@@ -420,8 +422,15 @@ function updateNLabels(n) {
   document.querySelectorAll(".js-n").forEach((el) => { el.textContent = n; });
 }
 const DEFAULT_PICK = { bk: "BK0877", name: "PCB" };
-// 虚拟板块：后端 ZX0001，成分由 Worker 每日从当日热点概念板块的龙头股合成
-const MAINLINE = { bk: "ZX0001", name: "主线股票", type: "mainline", pct: null };
+// 虚拟板块（后端 ZX 命名空间，不对应东财任何板块，成分由 Worker 提供）。
+// 新增一个虚拟板块＝在这里加一条 + 后端 VIRTUAL_BOARDS 加一条；
+// 同时把 SEED_VIRTUAL_KEY 的版本号加一，老用户才会被补上新 chip。
+const VIRTUAL_BOARDS = [
+  { bk: "ZX0001", name: "主线股票", type: "mainline", pct: null, tag: "热点", sub: "每日自动取当日热点板块龙头" },
+  { bk: "ZX0002", name: "我的主线", type: "mainline", pct: null, tag: "自选", sub: "固定名单 · 按题材分组" },
+];
+const VIRTUAL_BY_BK = new Map(VIRTUAL_BOARDS.map(b => [b.bk, b]));
+const isVirtual = (bk) => VIRTUAL_BY_BK.has(bk);
 const BK_RE = /^BK\d{4,6}$/;              // 仅用于下拉里“手动加入东财板块代码”
 const ID_RE = /^(?:BK\d{4,6}|ZX\d{4})$/;  // 自选 / 路由校验，含虚拟板块
 
@@ -491,8 +500,8 @@ function loadPicks() {
       if (cleaned.length) return cleaned;
     }
   } catch {}
-  // 新用户默认落在「主线股票」；PCB 兜底跟在后面（它有硬编码种子，后端再挂也能出数）
-  return [{ bk: MAINLINE.bk, name: MAINLINE.name }, { ...DEFAULT_PICK }];
+  // 新用户默认落在「主线股票」；PCB 兜底跟在最后（它有硬编码种子，后端再挂也能出数）
+  return [...VIRTUAL_BOARDS.map(b => ({ bk: b.bk, name: b.name })), { ...DEFAULT_PICK }];
 }
 function savePicks() { try { localStorage.setItem(PICKS_KEY, JSON.stringify(PICKS)); } catch {} }
 function hasPick(bk) { return PICKS.some(p => p.bk === bk); }
@@ -537,8 +546,8 @@ async function loadSectorList() {
     BOARDS = Array.isArray(data.boards) ? data.boards : [];
   } catch { BOARDS = []; }
   boardsLoaded = BOARDS.length > 0;
-  // 主线是本地定义的虚拟板块，东财清单里没有，注入到最前面让它能被搜到
-  BOARDS = [{ ...MAINLINE }, ...BOARDS.filter(b => b.bk !== MAINLINE.bk)];
+  // 虚拟板块是本地定义的，东财清单里没有，注入到最前面让它们能被搜到
+  BOARDS = [...VIRTUAL_BOARDS, ...BOARDS.filter(b => !isVirtual(b.bk))];
   reconcilePickNames();
   seedMaterialsOnce();
 }
@@ -551,12 +560,14 @@ function reconcilePickNames() {
   const cur = BOARDS.find(b => b.bk === currentBk);
   if (cur) setBrand(cur.name, cur.bk);
 }
-// 老用户一次性补上「主线股票」chip：不切换当前板块，只是多一个入口。
-// 不依赖远端清单（ZX0001 是我们自己定的），所以在 init 里就能跑。
-function seedMainlineOnce() {
-  if (localStorage.getItem(SEED_MAINLINE_KEY) === "1") return;
-  if (!PICKS.some(p => p.bk === MAINLINE.bk)) PICKS.push({ bk: MAINLINE.bk, name: MAINLINE.name });
-  localStorage.setItem(SEED_MAINLINE_KEY, "1");
+// 老用户一次性补上虚拟板块 chip：不切换当前板块，只是多几个入口。
+// 不依赖远端清单（ZX 代码是我们自己定的），所以在 init 里就能跑。
+function seedVirtualBoardsOnce() {
+  if (localStorage.getItem(SEED_VIRTUAL_KEY) === "1") return;
+  VIRTUAL_BOARDS.forEach(b => {
+    if (!PICKS.some(p => p.bk === b.bk)) PICKS.push({ bk: b.bk, name: b.name });
+  });
+  localStorage.setItem(SEED_VIRTUAL_KEY, "1");
 }
 function seedMaterialsOnce() {
   if (!boardsLoaded) return; // 清单没加载成功就不标记“已尝试”，下次再试
@@ -586,7 +597,7 @@ function renderDropdown() {
     `<div class="dd-row" data-bk="${b.bk}" data-name="${escapeHtml(b.name)}" data-i="${i}">` +
       `<span class="dd-name">${escapeHtml(b.name)}</span>` +
       `<span class="dd-bk">${b.bk}</span>` +
-      `<span class="dd-type">${b.type === "industry" ? "行业" : b.type === "mainline" ? "主线" : "概念"}</span>` +
+      `<span class="dd-type">${b.tag || (b.type === "industry" ? "行业" : "概念")}</span>` +
       // 主线是聚合板块，没有单一涨幅（pct 为 null），直接 toFixed 会抛错炸掉整个下拉
       (Number.isFinite(b.pct)
         ? `<span class="dd-pct ${b.pct > 0 ? "up" : b.pct < 0 ? "down" : "flat"}">${b.pct > 0 ? "+" : ""}${b.pct.toFixed(2)}%</span>`
@@ -624,7 +635,7 @@ function paintHi(list) { list.forEach((r, i) => r.classList.toggle("hi", i === d
 function setBrand(name, bk) {
   document.getElementById("brand-name").textContent = name || bk || "板块布林带看板";
   document.getElementById("brand-bk").textContent =
-    bk === MAINLINE.bk ? "每日自动取当日热点板块龙头" : (bk ? `板块 ${bk}` : "");
+    VIRTUAL_BY_BK.get(bk)?.sub ?? (bk ? `板块 ${bk}` : "");
 }
 function selectBoard(bk, name) {
   if (!ID_RE.test(bk)) return;
@@ -653,12 +664,12 @@ async function loadData(force) {
       showToast("加载失败：" + e.message, true);
       return;
     }
-    // 首屏且当前是主线板块：主线依赖东财热点清单，挂了就自动退到下一个自选，
+    // 首屏且当前是虚拟板块：它们依赖东财/腾讯接口，挂了就自动退到下一个自选，
     // 免得新用户第一次打开看到的是一张错误页。
-    if (currentBk === MAINLINE.bk) {
-      const next = PICKS.find(p => p.bk !== MAINLINE.bk);
+    if (isVirtual(currentBk)) {
+      const next = PICKS.find(p => p.bk !== currentBk);
       if (next) {
-        showToast("主线股票暂时取不到成分，已切到 " + next.name, true);
+        showToast(`${VIRTUAL_BY_BK.get(currentBk).name}暂时取不到成分，已切到 ${next.name}`, true);
         selectBoard(next.bk, next.name);
         return;
       }
@@ -708,10 +719,15 @@ function applyData(data) {
   else document.getElementById("d-name").textContent = "该板块暂无数据";
 }
 
-// 主线板块：把当日入选的几条热点主线写在排行表标题右侧，顺带交代成分是哪天的快照。
+// 排行表标题右侧的说明：固定名单板块用后端给的 note，自动主线列出当日入选的题材，
+// 普通东财板块保持原来的操作提示。
 function renderBoardNote(data) {
   const note = document.getElementById("board-note");
   if (!note) return;
+  if (data.note) {
+    note.textContent = data.note;
+    return;
+  }
   if (!data.themes || !data.themes.length) {
     note.textContent = "点击列头排序，点击行查看详情";
     return;
@@ -928,7 +944,7 @@ function highlightActive() {
 /* ============ 初始化 ============ */
 function init() {
   PICKS = loadPicks();
-  seedMainlineOnce(); // 老用户补 chip；新用户 loadPicks 里已经带上了
+  seedVirtualBoardsOnce(); // 老用户补 chip；新用户 loadPicks 里已经带上了
   const urlBk = new URLSearchParams(location.search).get("bk");
   if (urlBk && ID_RE.test(urlBk.toUpperCase())) {
     const bk = urlBk.toUpperCase();

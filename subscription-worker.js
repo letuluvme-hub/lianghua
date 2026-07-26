@@ -1304,6 +1304,39 @@ const SECTOR_BK_RE = /^BK\d{4,6}$/;
 // 对外入口改用 SECTOR_ID_RE，这样虚拟板块能复用整条管线（KV 缓存 / 16:00 定时刷新 / 参数设置）。
 const MAINLINE_BK = "ZX0001";
 const MAINLINE_NAME = "主线股票";
+const MYLINE_BK = "ZX0002";
+const MYLINE_NAME = "我的主线";
+// 手工维护的固定名单：改名单＝改这里 + node deploy-subscription-worker.js。
+// market 用东财口径："1"=沪、"0"=深，与 fetchSectorCloses 的 sh/sz 映射一致。
+// 代码务必写满 6 位——从表格里粘出来常会丢前导零（如 977 实为 000977）。
+const MYLINE_STOCKS = [
+  { code: "688256", name: "寒武纪-U", market: "1", theme: "AI算力" },
+  { code: "688041", name: "海光信息", market: "1", theme: "AI算力" },
+  { code: "000977", name: "浪潮信息", market: "0", theme: "AI算力" },
+  { code: "002230", name: "科大讯飞", market: "0", theme: "AI算力" },
+  { code: "300033", name: "同花顺", market: "0", theme: "AI算力" },
+  { code: "601179", name: "中国西电", market: "1", theme: "电力设备" },
+  { code: "600406", name: "国电南瑞", market: "1", theme: "电力设备" },
+  { code: "002028", name: "思源电气", market: "0", theme: "电力设备" },
+  { code: "601985", name: "中国核电", market: "1", theme: "核电与新能源发电" },
+  { code: "001258", name: "立新能源", market: "0", theme: "核电与新能源发电" },
+  { code: "002156", name: "通富微电", market: "0", theme: "半导体封测" },
+  { code: "600584", name: "长电科技", market: "1", theme: "半导体封测" },
+  { code: "002185", name: "华天科技", market: "0", theme: "半导体封测" },
+  { code: "688981", name: "中芯国际", market: "1", theme: "芯片制造与存储" },
+  { code: "603986", name: "兆易创新", market: "1", theme: "芯片制造与存储" },
+  { code: "300750", name: "宁德时代", market: "0", theme: "锂电与光伏" },
+  { code: "002594", name: "比亚迪", market: "0", theme: "锂电与光伏" },
+  { code: "300014", name: "亿纬锂能", market: "0", theme: "锂电与光伏" },
+  { code: "300274", name: "阳光电源", market: "0", theme: "锂电与光伏" },
+  { code: "601012", name: "隆基绿能", market: "1", theme: "锂电与光伏" },
+];
+// ZX 命名空间下的全部虚拟板块（都不对应东财任何板块）。
+// 带 stocks 的是固定名单，不带的是自己推导成分（目前只有主线股票）。
+const VIRTUAL_BOARDS = {
+  [MAINLINE_BK]: { name: MAINLINE_NAME },
+  [MYLINE_BK]: { name: MYLINE_NAME, stocks: MYLINE_STOCKS },
+};
 const MAINLINE_BOARD_TOP = 8; // 取当日涨幅前 8 的概念板块作为「主线」
 const MAINLINE_MIN_BOARDS = 4; // 上涨板块少于这个数就放宽涨跌符号，见 fetchMainlineRanking
 const MAINLINE_PER_BOARD = 3; // 每条主线至少取涨幅前 3 的成分股
@@ -1500,7 +1533,44 @@ function isUsableMainlineStock(s) {
   );
 }
 
+// 固定名单没有东财的 f21 流通市值，用腾讯报价批量补一次（20 只一个请求）。
+// 字段 [44] = 流通市值（亿元），[45] 是总市值，别取错；这里换算成「元」，
+// 让下游 refreshSectorBollinger 的 `mcap / 1e8` 与东财 f21 口径保持一致。
+// 响应是 GBK，text() 按 UTF-8 解码会把中文弄花，但分隔符 ~ 和 " 都是 ASCII，
+// 我们只取数字字段，不受影响（与 fetchRealtimeQuote 同一处理方式）。
+async function withMarketCaps(stocks) {
+  try {
+    const symbols = stocks.map((s) => toTencentQuoteSymbol(s.code, s.market));
+    const response = await fetch(`https://qt.gtimg.cn/q=${symbols.join(",")}`, {
+      headers: { Referer: "https://gu.qq.com/", Accept: "*/*", "User-Agent": "Mozilla/5.0" },
+    });
+    if (!response.ok) throw new Error(`tencent quote batch returned ${response.status}`);
+    const text = await response.text();
+    const caps = new Map();
+    for (const m of text.matchAll(/v_(\w+)="([^"]*)"/g)) {
+      const yi = Number(m[2].split("~")[44]);
+      if (Number.isFinite(yi) && yi > 0) caps.set(m[1], yi * 1e8);
+    }
+    if (!caps.size) throw new Error("tencent quote batch 未解析到流通市值");
+    return stocks.map((s, i) => ({ ...s, mcap: caps.get(symbols[i]) || 0 }));
+  } catch (err) {
+    // 市值只影响详情面板的一行展示，取不到就留 0（前端显示「—」），不拖垮整个板块
+    console.warn("[sector] market cap batch failed:", err?.message || err);
+    return stocks.map((s) => ({ ...s, mcap: 0 }));
+  }
+}
+
 async function fetchSectorRanking(env, bk, topN = SECTOR_TOP_N, opts = {}) {
+  // 固定名单板块：成分写死在 VIRTUAL_BOARDS 里，不用派生也不用快照缓存
+  const fixed = VIRTUAL_BOARDS[bk]?.stocks;
+  if (fixed) {
+    const groups = new Set(fixed.map((s) => s.theme).filter(Boolean));
+    return {
+      ranking: await withMarketCaps(fixed),
+      source: "fixed-list",
+      note: `固定名单 · ${fixed.length} 只${groups.size ? ` · ${groups.size} 个题材` : ""}`,
+    };
+  }
   // 主线是虚拟板块，成分自己推导，且是「当日快照」：同一天内复用，
   // 免得用户每换一次 周期N/复权 都重新派生一遍（成分只跟日期有关，跟 N 无关）。
   if (bk === MAINLINE_BK) {
@@ -1579,7 +1649,8 @@ async function fetchSectorCloses(stock, days = SECTOR_LOOKBACK_DAYS, adjust = SE
 }
 
 async function getBoardName(env, bk) {
-  if (bk === MAINLINE_BK) return MAINLINE_NAME; // 虚拟板块不在东财清单里
+  const virtual = VIRTUAL_BOARDS[bk];
+  if (virtual) return virtual.name; // 虚拟板块不在东财清单里
   const list = safeJsonParse(await env.SUBSCRIPTIONS.get(SECTOR_LIST_KV_KEY));
   const hit = list?.boards?.find((b) => b.bk === bk);
   return hit?.name || bk;
@@ -1588,7 +1659,7 @@ async function getBoardName(env, bk) {
 async function refreshSectorBollinger(env, bk, opts = {}) {
   const days = opts.days || SECTOR_LOOKBACK_DAYS;
   const adjust = SECTOR_ADJUSTS.has(opts.adjust) ? opts.adjust : SECTOR_DEFAULT_ADJUST;
-  const { ranking, source: rankingSource, themes } = await fetchSectorRanking(env, bk, SECTOR_TOP_N, {
+  const { ranking, source: rankingSource, themes, note } = await fetchSectorRanking(env, bk, SECTOR_TOP_N, {
     force: opts.force,
   });
   // 单只个股拉不到（停牌/退市/新股）不应拖垮整个板块，逐只兜底为 null 再过滤。
@@ -1616,7 +1687,7 @@ async function refreshSectorBollinger(env, bk, opts = {}) {
   // 主线板块常年混进次新股：它们的 closes 比公共横轴短，画在图上会贴到左端，BOLL 也没意义。
   // 只在剩得下足够样本时剔除，避免整块被清空。
   let usable = enriched;
-  if (bk === MAINLINE_BK) {
+  if (VIRTUAL_BOARDS[bk]) {
     const full = enriched.filter((s) => s.closes.length >= days);
     if (full.length >= 3) usable = full;
   }
@@ -1632,6 +1703,7 @@ async function refreshSectorBollinger(env, bk, opts = {}) {
     latestTradeDate: axis.dates[axis.dates.length - 1] || "",
     basedOnDate: beijingDate(),
     ...(themes?.length ? { themes } : {}),
+    ...(note ? { note } : {}),
     dates: axis.dates,
     stocks: usable.map((s) => ({
       code: s.code,
@@ -1691,7 +1763,7 @@ async function getTrackedSectors(env) {
   const cur = safeJsonParse(await env.SUBSCRIPTIONS.get(SECTOR_TRACKED_KV_KEY)) || { codes: [] };
   const set = new Set(cur.codes || []);
   set.add(PCB_BK_CODE); // 始终包含 PCB
-  set.add(MAINLINE_BK); // 始终包含主线股票
+  Object.keys(VIRTUAL_BOARDS).forEach((bk) => set.add(bk)); // 虚拟板块也始终刷
   return [...set];
 }
 
