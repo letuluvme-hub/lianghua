@@ -1265,8 +1265,9 @@ export default {
         (async () => {
           await refreshSectorList(env).catch((err) => console.error("[sector list refresh]", err?.message || err));
           const bks = await getTrackedSectors(env);
+          // force：让主线板块按当日收盘涨幅重新派生成分，而不是复用盘中那份快照
           await mapWithConcurrency(bks, 2, (bk) =>
-            refreshSectorBollinger(env, bk).catch((err) =>
+            refreshSectorBollinger(env, bk, { force: true }).catch((err) =>
               console.error(`[sector refresh ${bk}]`, err?.message || err)
             )
           );
@@ -1286,6 +1287,9 @@ export default {
 //   3) 板块清单 = 东方财富 概念(t:3)+行业(t:2) 板块全集，供前端搜索/自选
 // 每工作日 16:00（北京时间）自动刷新“被访问过的板块集合”与板块清单到 KV。
 // 前端读 /api/sector-bollinger?bk=BKxxxx（PCB 走缺省 bk=BK0877）或 /api/sector-list。
+//
+// 另有 ZXxxxx 虚拟板块命名空间：不对应东财任何板块，成分由 Worker 自己推导，其余流程完全复用。
+// 目前只有一个 ZX0001「主线股票」= 当日涨幅居前的概念板块各取涨幅龙头，每天一份快照。
 
 const PCB_BK_CODE = "BK0877"; // 东财 PCB 概念板块（默认自选之一，含硬编码兜底）
 const SECTOR_TOP_N = 20;
@@ -1294,6 +1298,21 @@ const SECTOR_LIST_KV_KEY = "sector:list:v1";
 const SECTOR_TRACKED_KV_KEY = "sector:tracked";
 const SECTOR_TRACKED_MAX = 40;
 const SECTOR_BK_RE = /^BK\d{4,6}$/;
+
+// ---- 虚拟板块「主线股票」：不是东财某个板块，而是当日最热概念板块的龙头股合成 ----
+// 走 ZX 前缀是为了和东财 BKxxxx 分开：SECTOR_BK_RE 仍只认 BK（解析东财返回时用），
+// 对外入口改用 SECTOR_ID_RE，这样虚拟板块能复用整条管线（KV 缓存 / 16:00 定时刷新 / 参数设置）。
+const MAINLINE_BK = "ZX0001";
+const MAINLINE_NAME = "主线股票";
+const MAINLINE_BOARD_TOP = 8; // 取当日涨幅前 8 的概念板块作为「主线」
+const MAINLINE_PER_BOARD = 3; // 每条主线取涨幅前 3 的成分股
+const MAINLINE_MIN_STOCKS = 5; // 少于这个数就用板块清单里的领涨股补位
+const MAINLINE_MIN_MCAP = 3e9; // 流通市值下限 30 亿（f21 单位为元），滤掉涨幅榜上的微盘噪音
+const SECTOR_ID_RE = /^(?:BK\d{4,6}|ZX\d{4})$/;
+// 东财「概念板块」里混着一批风格/标的类板块（融资融券标的、破净股、昨日涨停…），
+// 它们不是题材主线，涨幅又经常靠前，必须排除，否则主线板块会被这些噪音占满。
+const MAINLINE_EXCLUDE_RE =
+  /融资融券|转融券|标的|股通|MSCI|富时|标普|ST|破净|昨日|今日|高送转|次新|重仓|QFII|社保|证金|参股|壳资源|举牌|回购|增持|减持|解禁|限售|百元股|茅指数|宁组合|国企改革|员工持股|同花顺|富时罗素/;
 const EASTMONEY_HOSTS = [
   "push2.eastmoney.com",
   "50.push2.eastmoney.com",
@@ -1356,30 +1375,152 @@ function shouldRefreshPcbNow(now = new Date()) {
   return isWeekday && hour === 16 && minute < 3;
 }
 
-async function fetchSectorRanking(env, bk, topN = SECTOR_TOP_N) {
-  // 东财 push2 有多个分片，Worker 出口 IP 在某些分片上会 502。逐个试，命中即返回；
-  // 全失败则回退 KV 上次缓存，仅 PCB(BK0877) 再回退硬编码种子，其余抛错交前端提示。
+// 东财板块成分：按流通市值 f21 降序取 TopN（po=1 即降序）
+async function fetchEastmoneyPlateRanking(bk, topN = SECTOR_TOP_N) {
   const urls = EASTMONEY_HOSTS.map(
     (h) =>
       `https://${h}/api/qt/clist/get` +
       `?pn=1&pz=${topN + 5}&po=1&np=1&fid=f21&fs=b:${bk}` +
       `&fields=f12,f13,f14,f21`
   );
+  const data = await fetchJsonWithRetry(
+    urls,
+    { headers: { Accept: "application/json", Referer: "https://quote.eastmoney.com/" } },
+    `eastmoney plate ${bk}`
+  );
+  const diff = data?.data?.diff;
+  if (!diff) throw new Error(`eastmoney 未返回板块 ${bk} 成分股`);
+  const list = Array.isArray(diff) ? diff : Object.values(diff);
+  const ranking = list.slice(0, topN).map((item) => ({
+    code: String(item.f12),
+    name: String(item.f14),
+    market: item.f13 === 1 ? "1" : "0",
+    mcap: Number(item.f21) || 0,
+  }));
+  return { ranking };
+}
+
+// 主线股票：当日涨幅前 MAINLINE_BOARD_TOP 的概念板块，各取涨幅前 MAINLINE_PER_BOARD 只成分股，
+// 去重后即「当下市场主线的龙头集合」。每只股票带 theme = 它所属的那条主线。
+async function fetchMainlineRanking(env, topN = SECTOR_TOP_N) {
+  // 1) 当日板块清单。清单本身已按当日涨幅降序，且 16:00 cron 会先刷它再刷各板块。
+  //    正常情况下这里 0 个子请求：前端每次打开页面都会打 /api/sector-list，KV 里是热的。
+  const { boards: allBoards } = await getSectorList(env);
+  const boards = (allBoards || [])
+    .filter((b) => b.type === "concept" && Number(b.pct) > 0 && !MAINLINE_EXCLUDE_RE.test(b.name))
+    .slice(0, MAINLINE_BOARD_TOP);
+  if (!boards.length) throw new Error("暂时没有取到当日热点板块，无法合成主线股票");
+
+  // 2) 每条主线取涨幅龙头。只用前 2 个分片：fetchJsonWithRetry 每个 URL 重试 2 次，
+  //    5 个 host 就是 10 次子请求，叠加清单翻页和 20 只成分股 K 线会撞上 Worker 子请求上限。
+  //    多取几只再筛（ST/北交所/微盘会淘汰掉一部分），子请求数不变。
+  const hosts = EASTMONEY_HOSTS.slice(0, 2);
+  const perBoard = await mapWithConcurrency(boards, 3, async (board) => {
+    try {
+      const data = await fetchJsonWithRetry(
+        hosts.map(
+          (h) =>
+            `https://${h}/api/qt/clist/get` +
+            `?pn=1&pz=10&po=1&np=1&fid=f3&fs=b:${board.bk}` +
+            `&fields=f12,f13,f14,f21,f3`
+        ),
+        { headers: { Accept: "application/json", Referer: "https://quote.eastmoney.com/" } },
+        `eastmoney mainline ${board.bk}`
+      );
+      const diff = data?.data?.diff;
+      const items = Array.isArray(diff) ? diff : Object.values(diff || {});
+      return items
+        .map((item) => ({
+          code: String(item.f12 || ""),
+          name: String(item.f14 || ""),
+          market: item.f13 === 1 ? "1" : "0",
+          mcap: Number(item.f21) || 0, // f21 = 流通市值（元）
+          pct: Number(item.f3) / 100, // f3 = 涨跌幅×100；停牌返回 "-" → NaN
+          theme: board.name,
+        }))
+        .filter(isUsableMainlineStock)
+        .slice(0, MAINLINE_PER_BOARD);
+    } catch (err) {
+      console.warn(`[mainline] board ${board.bk} constituents failed:`, err?.message || err);
+      return [];
+    }
+  });
+
+  // 3) 轮次展开：先各板块龙一，再龙二……保证每条热点主线都有代表。
+  //    直接摊平再截断会让前几个板块吃满 20 个名额，把靠后的主线整条挤掉。
+  //    mapWithConcurrency 按下标回填，perBoard 始终是板块热度序，去重结果是确定的。
+  const seen = new Set();
+  const ranking = [];
+  const take = (s) => {
+    if (!s || seen.has(s.code) || ranking.length >= topN) return;
+    seen.add(s.code); // 同股跨板块去重：先命中的（更热的主线）胜出
+    ranking.push(s);
+  };
+  for (let r = 0; r < MAINLINE_PER_BOARD && ranking.length < topN; r += 1) {
+    perBoard.forEach((stocks) => take(stocks[r]));
+  }
+
+  // 4) 兜底补位：逐板块请求全挂时，用板块清单自带的领涨股（f128/f140/f141）凑数，不额外发请求
+  if (ranking.length < MAINLINE_MIN_STOCKS) {
+    boards.forEach((b) => {
+      if (!b.lead?.code) return;
+      const lead = { ...b.lead, mcap: 0, pct: Number(b.pct), theme: b.name };
+      if (isUsableMainlineStock({ ...lead, mcap: MAINLINE_MIN_MCAP })) take(lead); // 领涨股没有市值字段，跳过市值门槛
+    });
+  }
+  if (!ranking.length) throw new Error("暂时无法合成主线股票成分，请稍后重试");
+
+  return {
+    ranking,
+    themes: boards.map((b, i) => ({ bk: b.bk, name: b.name, pct: b.pct, count: perBoard[i].length })),
+  };
+}
+
+// 主线成分的准入：正常 A 股代码、非 ST/退市、非北交所（fetchSectorCloses 只映射 sh/sz）、
+// 非停牌（f3 为 "-" 时 pct 是 NaN）、流通市值过线。市值门槛是让这张表看着像「主线」而不是「妖股榜」。
+function isUsableMainlineStock(s) {
+  return (
+    /^\d{6}$/.test(s.code) &&
+    !/^(4|8|92)/.test(s.code) &&
+    !/ST|退/.test(s.name) &&
+    Number.isFinite(s.pct) &&
+    s.mcap >= MAINLINE_MIN_MCAP
+  );
+}
+
+async function fetchSectorRanking(env, bk, topN = SECTOR_TOP_N, opts = {}) {
+  // 主线是虚拟板块，成分自己推导，且是「当日快照」：同一天内复用，
+  // 免得用户每换一次 周期N/复权 都重新派生一遍（成分只跟日期有关，跟 N 无关）。
+  if (bk === MAINLINE_BK) {
+    const cached = safeJsonParse(await env.SUBSCRIPTIONS.get(sectorRankingKey(bk)));
+    if (!opts.force && cached?.ranking?.length && cached.savedDate === beijingDate()) {
+      return { ranking: cached.ranking, themes: cached.themes || [], source: `mainline-snapshot ${cached.savedDate}` };
+    }
+    try {
+      const { ranking, themes } = await fetchMainlineRanking(env, topN);
+      await env.SUBSCRIPTIONS.put(
+        sectorRankingKey(bk),
+        JSON.stringify({ savedAt: new Date().toISOString(), savedDate: beijingDate(), ranking, themes })
+      ).catch(() => {});
+      return { ranking, themes, source: "eastmoney-hotboards" };
+    } catch (err) {
+      console.warn("[sector] mainline ranking failed:", err?.message || err);
+      // 回退上一交易日快照。盘前板块涨幅全是 0、热点选不出来时也会走到这里，正是想要的行为。
+      if (cached?.ranking?.length) {
+        return { ranking: cached.ranking, themes: cached.themes || [], source: `kv-cache (saved ${cached.savedAt})` };
+      }
+      // 主线是「当日」概念，写死名单只会变成过期噪音，故不设硬编码种子
+      throw new Error("暂时无法获取主线股票成分，请稍后重试");
+    }
+  }
+  return fetchBkSectorRanking(env, bk, topN);
+}
+
+async function fetchBkSectorRanking(env, bk, topN = SECTOR_TOP_N) {
+  // 东财 push2 有多个分片，Worker 出口 IP 在某些分片上会 502。逐个试，命中即返回；
+  // 全失败则回退 KV 上次缓存，仅 PCB(BK0877) 再回退硬编码种子，其余抛错交前端提示。
   try {
-    const data = await fetchJsonWithRetry(
-      urls,
-      { headers: { Accept: "application/json", Referer: "https://quote.eastmoney.com/" } },
-      `eastmoney plate ${bk}`
-    );
-    const diff = data?.data?.diff;
-    if (!diff) throw new Error(`eastmoney 未返回板块 ${bk} 成分股`);
-    const list = Array.isArray(diff) ? diff : Object.values(diff);
-    const ranking = list.slice(0, topN).map((item) => ({
-      code: String(item.f12),
-      name: String(item.f14),
-      market: item.f13 === 1 ? "1" : "0",
-      mcap: Number(item.f21) || 0,
-    }));
+    const { ranking } = await fetchEastmoneyPlateRanking(bk, topN);
     if (ranking.length) {
       // 成功，写回 KV 作为后续兜底
       await env.SUBSCRIPTIONS.put(
@@ -1423,6 +1564,7 @@ async function fetchSectorCloses(stock, days = SECTOR_LOOKBACK_DAYS, adjust = SE
 }
 
 async function getBoardName(env, bk) {
+  if (bk === MAINLINE_BK) return MAINLINE_NAME; // 虚拟板块不在东财清单里
   const list = safeJsonParse(await env.SUBSCRIPTIONS.get(SECTOR_LIST_KV_KEY));
   const hit = list?.boards?.find((b) => b.bk === bk);
   return hit?.name || bk;
@@ -1431,7 +1573,9 @@ async function getBoardName(env, bk) {
 async function refreshSectorBollinger(env, bk, opts = {}) {
   const days = opts.days || SECTOR_LOOKBACK_DAYS;
   const adjust = SECTOR_ADJUSTS.has(opts.adjust) ? opts.adjust : SECTOR_DEFAULT_ADJUST;
-  const { ranking, source: rankingSource } = await fetchSectorRanking(env, bk);
+  const { ranking, source: rankingSource, themes } = await fetchSectorRanking(env, bk, SECTOR_TOP_N, {
+    force: opts.force,
+  });
   // 单只个股拉不到（停牌/退市/新股）不应拖垮整个板块，逐只兜底为 null 再过滤。
   const enriched = (
     await mapWithConcurrency(ranking, 5, async (s) => {
@@ -1442,6 +1586,7 @@ async function refreshSectorBollinger(env, bk, opts = {}) {
           code: `${s.market === "1" ? "sh" : "sz"}${s.code}`,
           name: s.name,
           mcap: +(s.mcap / 1e8).toFixed(2),
+          theme: s.theme || "",
           dates,
           closes,
         };
@@ -1452,8 +1597,15 @@ async function refreshSectorBollinger(env, bk, opts = {}) {
     })
   ).filter(Boolean);
   if (!enriched.length) throw new Error(`板块 ${bk} 暂无可用K线数据，请稍后重试`);
+  // 主线板块常年混进次新股：它们的 closes 比公共横轴短，画在图上会贴到左端，BOLL 也没意义。
+  // 只在剩得下足够样本时剔除，避免整块被清空。
+  let usable = enriched;
+  if (bk === MAINLINE_BK) {
+    const full = enriched.filter((s) => s.closes.length >= days);
+    if (full.length >= 3) usable = full;
+  }
   // 以成分股中最长的日期序列为公共横轴，尽量减少停牌股错位
-  const axis = enriched.reduce((a, b) => (b.dates.length > a.dates.length ? b : a), enriched[0]);
+  const axis = usable.reduce((a, b) => (b.dates.length > a.dates.length ? b : a), usable[0]);
   const payload = {
     updatedAt: new Date().toISOString(),
     bk,
@@ -1462,11 +1614,14 @@ async function refreshSectorBollinger(env, bk, opts = {}) {
     adjust,
     source: `ranking=${rankingSource} + kline=tencent-${adjust}`,
     latestTradeDate: axis.dates[axis.dates.length - 1] || "",
+    basedOnDate: beijingDate(),
+    ...(themes?.length ? { themes } : {}),
     dates: axis.dates,
-    stocks: enriched.map((s) => ({
+    stocks: usable.map((s) => ({
       code: s.code,
       name: s.name,
       mcap: s.mcap,
+      ...(s.theme ? { theme: s.theme } : {}),
       closes: s.closes,
     })),
   };
@@ -1483,14 +1638,14 @@ async function refreshSectorBollinger(env, bk, opts = {}) {
 async function handleSectorBollinger(request, env) {
   const url = new URL(request.url);
   let bk = String(url.searchParams.get("bk") || PCB_BK_CODE).toUpperCase();
-  if (!SECTOR_BK_RE.test(bk)) bk = PCB_BK_CODE;
+  if (!SECTOR_ID_RE.test(bk)) bk = PCB_BK_CODE;
   const forceRefresh = url.searchParams.get("refresh") === "1";
   const days =
     normalizePeriod(url.searchParams.get("days") ?? url.searchParams.get("period"), SECTOR_LOOKBACK_DAYS) ||
     SECTOR_LOOKBACK_DAYS;
   const adjustRaw = String(url.searchParams.get("adjust") || SECTOR_DEFAULT_ADJUST).toLowerCase();
   const adjust = SECTOR_ADJUSTS.has(adjustRaw) ? adjustRaw : SECTOR_DEFAULT_ADJUST;
-  const opts = { days, adjust };
+  const opts = { days, adjust, force: forceRefresh };
   await touchTrackedSector(env, bk).catch(() => {});
   if (forceRefresh) return json(await refreshSectorBollinger(env, bk, opts));
   const cached = safeJsonParse(await env.SUBSCRIPTIONS.get(sectorBollingerKey(bk, days, adjust)));
@@ -1518,6 +1673,7 @@ async function getTrackedSectors(env) {
   const cur = safeJsonParse(await env.SUBSCRIPTIONS.get(SECTOR_TRACKED_KV_KEY)) || { codes: [] };
   const set = new Set(cur.codes || []);
   set.add(PCB_BK_CODE); // 始终包含 PCB
+  set.add(MAINLINE_BK); // 始终包含主线股票
   return [...set];
 }
 
@@ -1525,12 +1681,13 @@ async function getTrackedSectors(env) {
 async function fetchSectorList() {
   // 东财单页最多 100 条（pz>100 会被截断），概念/行业各约 495/496 个，需翻页取全量。
   // 用 fid=f12 稳定排序翻页；f3 为涨跌幅×100（如 -108 = -1.08%），落库时除以 100。
+  // f128/f140/f141 = 领涨股名称/代码/市场，白拿的字段，供主线板块在逐板块请求失败时兜底补位。
   const PAGE = 100;
   const pageUrls = (t, pn) =>
     EASTMONEY_HOSTS.map(
       (h) =>
         `https://${h}/api/qt/clist/get` +
-        `?pn=${pn}&pz=${PAGE}&po=1&np=1&fid=f12&fs=m:90+t:${t}&fields=f12,f14,f3`
+        `?pn=${pn}&pz=${PAGE}&po=1&np=1&fid=f12&fs=m:90+t:${t}&fields=f12,f14,f3,f128,f140,f141`
     );
   const boards = [];
   const seen = new Set();
@@ -1553,7 +1710,16 @@ async function fetchSectorList() {
           const bk = String(item.f12 || "");
           if (!SECTOR_BK_RE.test(bk) || seen.has(bk)) continue;
           seen.add(bk);
-          boards.push({ bk, name: String(item.f14 || bk), type, pct: +((Number(item.f3) || 0) / 100).toFixed(2) });
+          const lead = /^\d{6}$/.test(String(item.f140 || ""))
+            ? { code: String(item.f140), name: String(item.f128 || ""), market: item.f141 === 1 ? "1" : "0" }
+            : null;
+          boards.push({
+            bk,
+            name: String(item.f14 || bk),
+            type,
+            pct: +((Number(item.f3) || 0) / 100).toFixed(2),
+            ...(lead ? { lead } : {}),
+          });
         }
         got += list.length;
         pn += 1;
@@ -1575,16 +1741,22 @@ async function refreshSectorList(env) {
   return payload;
 }
 
-async function handleSectorList(env) {
+// 当日板块清单：KV 命中当天的直接用，否则重拉；拉不到回退过期缓存。
+// 主线板块推导也复用它，所以从 handleSectorList 里抽出来单独一个函数。
+async function getSectorList(env) {
   const cached = safeJsonParse(await env.SUBSCRIPTIONS.get(SECTOR_LIST_KV_KEY));
   const today = beijingDate();
-  if (cached?.boards?.length && cached.savedDate === today) return json(cached);
+  if (cached?.boards?.length && cached.savedDate === today) return cached;
   try {
     const payload = await refreshSectorList(env);
-    if (payload.boards.length) return json(payload);
+    if (payload.boards.length) return payload;
   } catch (err) {
     console.warn("[sector] list refresh failed:", err?.message || err);
   }
-  if (cached?.boards?.length) return json(cached); // 拉取失败：回退过期缓存
-  return json({ savedAt: new Date().toISOString(), savedDate: today, boards: [] });
+  if (cached?.boards?.length) return cached; // 拉取失败：回退过期缓存
+  return { savedAt: new Date().toISOString(), savedDate: today, boards: [] };
+}
+
+async function handleSectorList(env) {
+  return json(await getSectorList(env));
 }

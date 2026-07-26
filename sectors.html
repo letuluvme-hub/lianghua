@@ -282,7 +282,7 @@ tbody tr.active td:first-child { box-shadow: inset 3px 0 0 var(--brand); }
 <div class="picker">
   <div class="picks" id="picks"></div>
   <div class="picker-search">
-    <input id="board-search" type="text" placeholder="搜索板块加入自选（如：半导体材料 / CPO / 固态电池 / BK1036）…" autocomplete="off" />
+    <input id="board-search" type="text" placeholder="搜索板块加入自选（如：主线股票 / 半导体材料 / CPO / 固态电池 / BK1036）…" autocomplete="off" />
     <div class="dropdown" id="board-dropdown"></div>
   </div>
   <button class="settings-toggle" id="settings-toggle" onclick="toggleSettings()">⚙ 参数设置</button>
@@ -313,7 +313,7 @@ tbody tr.active td:first-child { box-shadow: inset 3px 0 0 var(--brand); }
       <div class="card">
         <div class="card-head">
           <h2>排行表 <span class="sub">· 默认按区间排序</span></h2>
-          <span class="sub">点击列头排序，点击行查看详情</span>
+          <span class="sub" id="board-note">点击列头排序，点击行查看详情</span>
         </div>
         <div class="tablewrap">
           <table id="tbl"><thead><tr id="thead"></tr></thead><tbody id="tbody"></tbody></table>
@@ -345,6 +345,8 @@ tbody tr.active td:first-child { box-shadow: inset 3px 0 0 var(--brand); }
   公式：MA<sub class="js-n">20</sub> = <span class="js-n">20</span> 日收盘均值；σ = 总体标准差；K=k 上轨 = MA + k·σ，下轨 = MA − k·σ。
   中线日变动 = 今日 MID − 昨日 MID。%B = (Close − DN<sub>2</sub>) / (UP<sub>2</sub> − DN<sub>2</sub>)。
   数据源：东方财富板块成分（按流通市值降序取 Top20）+ 腾讯前复权日线；板块清单来自东财概念/行业板块，按当日涨幅（热度）排序。
+  「主线股票」为虚拟板块：每日自动取当日涨幅居前的概念板块（剔除融资融券/破净/昨日涨停等风格类板块），各取涨幅前 3 的成分股去重合成，
+  并剔除 ST、退市与北交所标的、流通市值低于 30 亿的微盘股。
 </div>
 
 <div id="toast" class="toast"></div>
@@ -354,6 +356,7 @@ const API_BASE = "/api/sector-bollinger";
 const LIST_API = "/api/sector-list";
 const PICKS_KEY = "bollSectorPicks";
 const SEED_MAT_KEY = "bollSectorSeededMat";
+const SEED_MAINLINE_KEY = "bollSectorSeededMainline";
 const SETTINGS_KEY = "bollSectorSettings";
 const DEFAULT_SETTINGS = { days: 20, adjust: "qfq" };
 const ADJUSTS = new Set(["qfq", "hfq", "none"]);
@@ -404,11 +407,15 @@ function updateNLabels(n) {
   document.querySelectorAll(".js-n").forEach((el) => { el.textContent = n; });
 }
 const DEFAULT_PICK = { bk: "BK0877", name: "PCB" };
-const BK_RE = /^BK\d{4,6}$/;
+// 虚拟板块：后端 ZX0001，成分由 Worker 每日从当日热点概念板块的龙头股合成
+const MAINLINE = { bk: "ZX0001", name: "主线股票", type: "mainline", pct: null };
+const BK_RE = /^BK\d{4,6}$/;              // 仅用于下拉里“手动加入东财板块代码”
+const ID_RE = /^(?:BK\d{4,6}|ZX\d{4})$/;  // 自选 / 路由校验，含虚拟板块
 
 let DATES = [], STOCKS = [], rows = [], chart = null, activeCode = null;
 let sortKey = "zoneIdx", sortDir = 1; // 默认按布林带区间排序（突破K3↑ → 突破K3↓），与主页“已选股票数据”一致
 let BOARDS = [];       // 全部板块清单 [{bk,name,type,pct}]
+let boardsLoaded = false; // 东财清单是否真的拉到（BOARDS 里恒有一条本地注入的主线，不能拿长度判断）
 let PICKS = [];        // 我的自选 [{bk,name}]
 let currentBk = "BK0877";
 let ddIndex = -1;      // 下拉高亮索引
@@ -453,17 +460,18 @@ function loadPicks() {
   try {
     const raw = JSON.parse(localStorage.getItem(PICKS_KEY) || "null");
     if (Array.isArray(raw) && raw.length) {
-      const cleaned = raw.filter(p => p && BK_RE.test(p.bk)).map(p => ({ bk: p.bk, name: p.name || p.bk }));
+      const cleaned = raw.filter(p => p && ID_RE.test(p.bk)).map(p => ({ bk: p.bk, name: p.name || p.bk }));
       if (cleaned.length) return cleaned;
     }
   } catch {}
-  return [{ ...DEFAULT_PICK }];
+  // 新用户默认落在「主线股票」；PCB 兜底跟在后面（它有硬编码种子，后端再挂也能出数）
+  return [{ bk: MAINLINE.bk, name: MAINLINE.name }, { ...DEFAULT_PICK }];
 }
 function savePicks() { try { localStorage.setItem(PICKS_KEY, JSON.stringify(PICKS)); } catch {} }
 function hasPick(bk) { return PICKS.some(p => p.bk === bk); }
 function addPick(bk, name, opts) {
   opts = opts || {};
-  if (!BK_RE.test(bk)) return;
+  if (!ID_RE.test(bk)) return;
   if (!hasPick(bk)) { PICKS.push({ bk, name: name || bk }); savePicks(); }
   renderPicks();
   if (opts.switchTo) selectBoard(bk, name);
@@ -501,6 +509,9 @@ async function loadSectorList() {
     const data = await r.json();
     BOARDS = Array.isArray(data.boards) ? data.boards : [];
   } catch { BOARDS = []; }
+  boardsLoaded = BOARDS.length > 0;
+  // 主线是本地定义的虚拟板块，东财清单里没有，注入到最前面让它能被搜到
+  BOARDS = [{ ...MAINLINE }, ...BOARDS.filter(b => b.bk !== MAINLINE.bk)];
   reconcilePickNames();
   seedMaterialsOnce();
 }
@@ -513,8 +524,15 @@ function reconcilePickNames() {
   const cur = BOARDS.find(b => b.bk === currentBk);
   if (cur) setBrand(cur.name, cur.bk);
 }
+// 老用户一次性补上「主线股票」chip：不切换当前板块，只是多一个入口。
+// 不依赖远端清单（ZX0001 是我们自己定的），所以在 init 里就能跑。
+function seedMainlineOnce() {
+  if (localStorage.getItem(SEED_MAINLINE_KEY) === "1") return;
+  if (!PICKS.some(p => p.bk === MAINLINE.bk)) PICKS.push({ bk: MAINLINE.bk, name: MAINLINE.name });
+  localStorage.setItem(SEED_MAINLINE_KEY, "1");
+}
 function seedMaterialsOnce() {
-  if (!BOARDS.length) return; // 清单没加载成功就不标记“已尝试”，下次再试
+  if (!boardsLoaded) return; // 清单没加载成功就不标记“已尝试”，下次再试
   if (localStorage.getItem(SEED_MAT_KEY) === "1") return;
   const mat = BOARDS.find(b => b.name === "半导体材料") || BOARDS.find(b => b.name.includes("半导体材料"));
   if (mat) addPick(mat.bk, mat.name);
@@ -531,7 +549,7 @@ function renderDropdown() {
   const dd = document.getElementById("board-dropdown");
   const q = input.value;
   ddIndex = -1;
-  if (!BOARDS.length) {
+  if (!boardsLoaded) {
     dd.innerHTML = `<div class="dd-empty">板块清单加载中或加载失败，可稍后重试；已有自选仍可使用</div>`;
     dd.classList.add("show");
     return;
@@ -541,8 +559,11 @@ function renderDropdown() {
     `<div class="dd-row" data-bk="${b.bk}" data-name="${escapeHtml(b.name)}" data-i="${i}">` +
       `<span class="dd-name">${escapeHtml(b.name)}</span>` +
       `<span class="dd-bk">${b.bk}</span>` +
-      `<span class="dd-type">${b.type === "industry" ? "行业" : "概念"}</span>` +
-      `<span class="dd-pct ${b.pct > 0 ? "up" : b.pct < 0 ? "down" : "flat"}">${b.pct > 0 ? "+" : ""}${b.pct.toFixed(2)}%</span>` +
+      `<span class="dd-type">${b.type === "industry" ? "行业" : b.type === "mainline" ? "主线" : "概念"}</span>` +
+      // 主线是聚合板块，没有单一涨幅（pct 为 null），直接 toFixed 会抛错炸掉整个下拉
+      (Number.isFinite(b.pct)
+        ? `<span class="dd-pct ${b.pct > 0 ? "up" : b.pct < 0 ? "down" : "flat"}">${b.pct > 0 ? "+" : ""}${b.pct.toFixed(2)}%</span>`
+        : `<span class="dd-pct flat">每日自动</span>`) +
     `</div>`
   ).join("");
   const upper = q.trim().toUpperCase();
@@ -575,10 +596,11 @@ function paintHi(list) { list.forEach((r, i) => r.classList.toggle("hi", i === d
 /* ============ 选择并加载某板块 ============ */
 function setBrand(name, bk) {
   document.getElementById("brand-name").textContent = name || bk || "板块布林带看板";
-  document.getElementById("brand-bk").textContent = bk ? `板块 ${bk}` : "";
+  document.getElementById("brand-bk").textContent =
+    bk === MAINLINE.bk ? "每日自动取当日热点板块龙头" : (bk ? `板块 ${bk}` : "");
 }
 function selectBoard(bk, name) {
-  if (!BK_RE.test(bk)) return;
+  if (!ID_RE.test(bk)) return;
   currentBk = bk;
   setBrand(name, bk);
   renderPicks();
@@ -603,6 +625,16 @@ async function loadData(force) {
       // 看板已渲染：加载失败只弹提示，保留现有数据，不整页覆盖成错误信息。
       showToast("加载失败：" + e.message, true);
       return;
+    }
+    // 首屏且当前是主线板块：主线依赖东财热点清单，挂了就自动退到下一个自选，
+    // 免得新用户第一次打开看到的是一张错误页。
+    if (currentBk === MAINLINE.bk) {
+      const next = PICKS.find(p => p.bk !== MAINLINE.bk);
+      if (next) {
+        showToast("主线股票暂时取不到成分，已切到 " + next.name, true);
+        selectBoard(next.bk, next.name);
+        return;
+      }
     }
     const content = document.getElementById("content");
     content.className = "card empty";
@@ -637,11 +669,28 @@ function applyData(data) {
     const st = stats(s.closes);
     st.zone = classifyCloseZone(st.last, st.mean, st.k1u, st.k1d, st.k2u, st.k2d, st.k3u, st.k3d);
     st.zoneIdx = st.zone.idx; // 供“区间”列排序
-    return { ...s, ...st };
+    return { ...s, theme: s.theme || "", ...st }; // theme 恒为字符串，排序走 localeCompare 分支
   });
+  COLS = buildCols(rows.some(r => r.theme));
+  // 按“主线”排完序再切到没有该列的板块，排序键会悬空；回落到默认的区间排序。
+  if (!COLS.some(c => c.sortKey === sortKey)) { sortKey = "zoneIdx"; sortDir = 1; }
+  renderBoardNote(data);
   renderTable();
   if (rows.length) selectStock(activeCode && rows.find(r => r.code === activeCode) ? activeCode : rows[0].code);
   else document.getElementById("d-name").textContent = "该板块暂无数据";
+}
+
+// 主线板块：把当日入选的几条热点主线写在排行表标题右侧，顺带交代成分是哪天的快照。
+function renderBoardNote(data) {
+  const note = document.getElementById("board-note");
+  if (!note) return;
+  if (!data.themes || !data.themes.length) {
+    note.textContent = "点击列头排序，点击行查看详情";
+    return;
+  }
+  const list = data.themes.slice(0, 5)
+    .map(t => `${t.name} ${t.pct > 0 ? "+" : ""}${t.pct}%`).join(" · ");
+  note.textContent = `今日主线：${list}` + (data.basedOnDate ? `（成分基于 ${data.basedOnDate}）` : "");
 }
 
 function stats(closes) {
@@ -676,7 +725,7 @@ function classifyCloseZone(close, mean, k1u, k1d, k2u, k2d, k3u, k3d) {
 }
 
 // sortKey：排序时实际读取的行字段（close→last、zone→zoneIdx、k1/k2/k3→上轨值）；null 表示该列不可排序。
-const COLS = [
+const BASE_COLS = [
   { k:"name",  t:"股票",     sortKey:"name",    fmt:(v,r)=>`<span class="stock-name">${r.name}</span><span class="stock-code">${r.code}</span>` },
   { k:"date",  t:"日期",     sortKey:null,      fmt:()=> DATES.length ? DATES[DATES.length-1] : "—" },
   { k:"close", t:"收盘",     sortKey:"last",    fmt:(v,r)=>`<span class="${r.pct>0?'up':r.pct<0?'down':'flat'}">${fmtNum(r.last,2)}</span>` },
@@ -688,6 +737,16 @@ const COLS = [
   { k:"k3",    t:"K3上/下",  sortKey:"k3u",     fmt:(v,r)=>`<span class="up">${fmtNum(r.k3u,2)}</span> / <span class="down">${fmtNum(r.k3d,2)}</span>` },
   { k:"chart", t:"查看",     sortKey:null,      fmt:(v,r)=>`<button onclick="event.stopPropagation();selectStock('${r.code}')" style="border:none;background:var(--brand);color:#fff;padding:3px 10px;border-radius:4px;font-size:11px;cursor:pointer;">查看</button>` },
 ];
+
+// 「主线」列只在成分股带 theme 时出现（目前只有主线股票板块会带），插在“股票”之后。
+const THEME_COL = { k:"theme", t:"主线", sortKey:"theme", fmt:(v)=> v ? `<span class="tag tag-mid">${escapeHtml(v)}</span>` : "—" };
+function buildCols(hasTheme) {
+  if (!hasTheme) return BASE_COLS;
+  const out = BASE_COLS.slice();
+  out.splice(1, 0, THEME_COL);
+  return out;
+}
+let COLS = BASE_COLS;
 
 function renderTable() {
   rows.sort((a,b)=>{
@@ -725,7 +784,10 @@ function selectStock(code) {
   const r = rows.find(x => x.code === code);
   if (!r) return;
 
-  document.getElementById("d-market").textContent = `${marketLabel(r.code)} · 流通市值 ${fmtNum(r.mcap, 2)} 亿`;
+  // mcap 为 0 = 由板块清单领涨股兜底补位进来的，没有市值字段，显示 — 而不是 0.00 亿
+  const mcapText = r.mcap > 0 ? `流通市值 ${fmtNum(r.mcap, 2)} 亿` : "流通市值 —";
+  document.getElementById("d-market").textContent =
+    [marketLabel(r.code), r.theme ? `主线 ${r.theme}` : "", mcapText].filter(Boolean).join(" · ");
   document.getElementById("d-name").textContent = r.name;
   document.getElementById("d-code").textContent = r.code;
 
@@ -811,8 +873,9 @@ function highlightActive() {
 /* ============ 初始化 ============ */
 function init() {
   PICKS = loadPicks();
+  seedMainlineOnce(); // 老用户补 chip；新用户 loadPicks 里已经带上了
   const urlBk = new URLSearchParams(location.search).get("bk");
-  if (urlBk && BK_RE.test(urlBk.toUpperCase())) {
+  if (urlBk && ID_RE.test(urlBk.toUpperCase())) {
     const bk = urlBk.toUpperCase();
     if (!hasPick(bk)) PICKS.unshift({ bk, name: bk });
     currentBk = bk;
