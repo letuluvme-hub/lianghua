@@ -21,11 +21,7 @@
   --up: #138a55;
   --down: #d63b34;
   --ok-bg: #f0fdf4;
-  --c-price: #2b62e0;
-  --c-middle: #c2410c;
-  --c-k1: #16a34a;
-  --c-k2: #d97706;
-  --c-k3: #9333ea;
+  /* 图表线条配色见脚本里的 SERIES（单一来源，图例与曲线共用） */
   --r-sm: 7px;
   --r-md: 9px;
   --r-lg: 12px;
@@ -204,10 +200,18 @@ tbody tr.active td:first-child { box-shadow: inset 3px 0 0 var(--brand); }
 .detail-head { padding: 16px 18px 12px; border-bottom: 1px solid var(--line); }
 .detail-eyebrow { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--ink-3); }
 .detail-eyebrow .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--brand); }
-.detail-title { margin: 6px 0 4px; font-size: 28px; font-weight: 700; color: var(--ink); letter-spacing: -.3px; }
+/* 标题行：股票名 + 代码在左，最新价大字在右（对齐基线，价格随涨跌着色） */
+.detail-titlerow { display: flex; align-items: baseline; justify-content: space-between; gap: 16px; margin: 6px 0 4px; }
+.detail-title { font-size: 28px; font-weight: 700; color: var(--ink); letter-spacing: -.3px; }
 .detail-title .code-suffix { color: var(--ink-3); font-weight: 500; font-size: 18px; margin-left: 10px; }
+.detail-price { font-size: 30px; font-weight: 800; font-variant-numeric: tabular-nums; letter-spacing: -.5px; white-space: nowrap; }
 .detail-sub { font-size: 12px; color: var(--ink-3); }
 .detail-sub .price { color: var(--ink); font-weight: 600; }
+@media (max-width: 560px) {
+  .detail-titlerow { flex-wrap: wrap; }
+  .detail-title { font-size: 23px; }
+  .detail-price { font-size: 25px; }
+}
 
 .stats-section { padding: 16px 18px; }
 .stats-section h3 {
@@ -226,21 +230,27 @@ tbody tr.active td:first-child { box-shadow: inset 3px 0 0 var(--brand); }
 }
 .stat .k { font-size: 11px; color: var(--ink-3); font-weight: 500; }
 .stat .v { font-size: 18px; font-weight: 700; color: var(--ink); margin-top: 4px; font-variant-numeric: tabular-nums; line-height: 1.2; }
-.stat .v2 { font-size: 18px; font-weight: 700; color: var(--ink); font-variant-numeric: tabular-nums; line-height: 1.25; }
+/* 上下轨写成一行「下 ~ 上」；原来 sep 是 div，会把三个数字挤成三行 */
+.stat .v2 {
+  font-size: 17px; font-weight: 700; color: var(--ink); margin-top: 4px;
+  font-variant-numeric: tabular-nums; line-height: 1.2; white-space: nowrap;
+}
 .stat .v2 .lo { color: var(--down); }
-.stat .v2 .sep { color: var(--ink-3); margin: 0 2px; font-weight: 400; }
+.stat .v2 .sep { color: var(--ink-3); margin: 0 3px; font-weight: 400; }
 .stat .v2 .hi { color: var(--up); }
 .stat.brand { background: var(--brand-tint); border-color: #c7d8ff; }
 .stat.brand .v { color: var(--brand-strong); }
 
 .chart-section { padding: 14px 16px 18px; }
 .chart-section .legend {
-  display: flex; gap: 14px; flex-wrap: wrap; margin: 0 0 10px;
+  display: flex; gap: 8px 16px; flex-wrap: wrap; margin: 12px 0 0; justify-content: center;
   font-size: 11px; color: var(--ink-2);
 }
-.chart-section .legend span { display: inline-flex; align-items: center; gap: 5px; }
+.chart-section .legend span { display: inline-flex; align-items: center; gap: 6px; }
+/* 空心圆点图例：环用线条色，比细横线更容易分辨 */
 .chart-section .legend i {
-  display: inline-block; width: 16px; height: 2px; border-radius: 2px;
+  display: inline-block; width: 12px; height: 12px; border-radius: 50%;
+  border: 3px solid currentColor; background: var(--surface); box-sizing: border-box;
 }
 .chart-wrap { position: relative; height: 380px; }
 
@@ -323,18 +333,21 @@ tbody tr.active td:first-child { box-shadow: inset 3px 0 0 var(--brand); }
       <div class="card" id="detail">
         <div class="detail-head">
           <div class="detail-eyebrow"><span class="dot"></span><span id="d-market">—</span></div>
-          <div class="detail-title"><span id="d-name">—</span><span class="code-suffix" id="d-code"></span></div>
+          <div class="detail-titlerow">
+            <div class="detail-title"><span id="d-name">—</span><span class="code-suffix" id="d-code"></span></div>
+            <div class="detail-price" id="d-price">—</div>
+          </div>
           <div class="detail-sub" id="d-sub">—</div>
+        </div>
+
+        <div class="chart-section">
+          <div class="chart-wrap"><canvas id="chart"></canvas></div>
+          <div class="legend" id="chart-legend"></div>
         </div>
 
         <div class="stats-section">
           <h3>布林带统计 BOLL(<span class="js-n">20</span>)</h3>
           <div class="stats-row" id="stats-row"></div>
-        </div>
-
-        <div class="chart-section">
-          <div class="legend" id="chart-legend"></div>
-          <div class="chart-wrap"><canvas id="chart"></canvas></div>
         </div>
       </div>
     </div>
@@ -412,7 +425,21 @@ const MAINLINE = { bk: "ZX0001", name: "主线股票", type: "mainline", pct: nu
 const BK_RE = /^BK\d{4,6}$/;              // 仅用于下拉里“手动加入东财板块代码”
 const ID_RE = /^(?:BK\d{4,6}|ZX\d{4})$/;  // 自选 / 路由校验，含虚拟板块
 
+// 图表线条的唯一配色来源，图例与曲线共用，避免两处各写一份色值。
+// 1σ/2σ 上下同色（同一档轨道）；3σ 是最外档提示位，上下分色更好读，
+// 且必须沿用本页 .up/.down 的语义（上轨绿、下轨红），否则会和正下方
+// 统计卡片里同一个数字的颜色打架。
+const SERIES = {
+  price: { color: "#141a24", label: "收盘价" },
+  mid:   { color: "#2b62e0", label: "中线 MID" },
+  k1:    { color: "#f0a868", label: "±1σ (K=1)" },
+  k2:    { color: "#d97706", label: "±2σ (K=2)" },
+  k3u:   { color: "#138a55", label: "K3 上" },
+  k3d:   { color: "#d63b34", label: "K3 下" },
+};
+
 let DATES = [], STOCKS = [], rows = [], chart = null, activeCode = null;
+let PERIOD = DEFAULT_SETTINGS.days; // 当前这批数据用的周期 N，图上滚动窗口按它取
 let sortKey = "zoneIdx", sortDir = 1; // 默认按布林带区间排序（突破K3↑ → 突破K3↓），与主页“已选股票数据”一致
 let BOARDS = [];       // 全部板块清单 [{bk,name,type,pct}]
 let boardsLoaded = false; // 东财清单是否真的拉到（BOARDS 里恒有一条本地注入的主线，不能拿长度判断）
@@ -663,10 +690,11 @@ function applyData(data) {
     content.innerHTML = "";
     content.appendChild(document.getElementById("layout-tpl").content.cloneNode(true));
   }
-  updateNLabels(data.days || SETTINGS.days);
+  PERIOD = data.days || SETTINGS.days;
+  updateNLabels(PERIOD);
 
   rows = STOCKS.map(s => {
-    const st = stats(s.closes);
+    const st = stats(s.closes, s.warmup);
     st.zone = classifyCloseZone(st.last, st.mean, st.k1u, st.k1d, st.k2u, st.k2d, st.k3u, st.k3d);
     st.zoneIdx = st.zone.idx; // 供“区间”列排序
     return { ...s, theme: s.theme || "", ...st }; // theme 恒为字符串，排序走 localeCompare 分支
@@ -693,14 +721,20 @@ function renderBoardNote(data) {
   note.textContent = `今日主线：${list}` + (data.basedOnDate ? `（成分基于 ${data.basedOnDate}）` : "");
 }
 
-function stats(closes) {
+const avg = (a) => a.reduce((s, x) => s + x, 0) / a.length;
+
+function stats(closes, warmup) {
   const n = closes.length;
   if (!n) return { mean:0, std:0, last:0, prev:0, pct:0, midPrev:0, midDelta:0, k1u:0,k1d:0,k2u:0,k2d:0,k3u:0,k3d:0, pctB:0 };
-  const mean = closes.reduce((a,b)=>a+b,0)/n;
+  const mean = avg(closes);
   const variance = closes.reduce((s,x)=>s+(x-mean)**2,0)/n;
   const std = Math.sqrt(variance);
-  // 中线日变动：今日 MA_N − 昨日 MA_N；只有 N 个值时用近似（差异在小数点后 2~3 位）。
-  const midPrev = (closes.slice(0, n-1).reduce((a,b)=>a+b,0) + closes[0]) / n;
+  // 中线日变动：今日 MA_N − 昨日 MA_N。后端给了热身收盘就能取到真正的「往前挪一根」窗口；
+  // 老缓存没有 warmup 时退回原来的近似（差异在小数点后 2~3 位）。
+  const w = Array.isArray(warmup) ? warmup : [];
+  const midPrev = w.length
+    ? avg(w.concat(closes).slice(-(n + 1), -1))
+    : (closes.slice(0, n-1).reduce((a,b)=>a+b,0) + closes[0]) / n;
   const midDelta = mean - midPrev;
   const last = closes[n-1], prev = closes[n-2] || last;
   const pct = prev ? ((last/prev)-1)*100 : 0;
@@ -791,56 +825,75 @@ function selectStock(code) {
   document.getElementById("d-name").textContent = r.name;
   document.getElementById("d-code").textContent = r.code;
 
+  const priceCls = r.pct > 0 ? "up" : r.pct < 0 ? "down" : "flat";
+  const dPrice = document.getElementById("d-price");
+  dPrice.textContent = fmtNum(r.last, 2);
+  dPrice.className = `detail-price ${priceCls}`;
+
   const lastDate = DATES[DATES.length-1];
-  const pctSpan = `<span class="${r.pct>0?'up':r.pct<0?'down':'flat'}">${r.pct>0?'+':''}${r.pct.toFixed(2)}%</span>`;
+  const pctSpan = `<span class="${priceCls}">${r.pct>0?'+':''}${r.pct.toFixed(2)}%</span>`;
   document.getElementById("d-sub").innerHTML =
-    `${lastDate} 最新价 <span class="price">${fmtNum(r.last,2)}</span> · 较昨 ${pctSpan} · 数据周期 ${DATES.length} 个交易日`;
+    `${lastDate} 收盘 · 较昨 ${pctSpan} · 数据周期 ${DATES.length} 个交易日`;
 
   const deltaCls = r.midDelta > 0 ? "up" : r.midDelta < 0 ? "down" : "flat";
+  const band = (k, lo, hi) =>
+    `<div class="stat"><div class="k">${k}</div><div class="v2">` +
+    `<span class="lo">${fmtNum(lo,2)}</span><span class="sep">~</span><span class="hi">${fmtNum(hi,2)}</span>` +
+    `</div></div>`;
   document.getElementById("stats-row").innerHTML = `
     <div class="stat brand"><div class="k">MID · 中线</div><div class="v">${fmtNum(r.mean,2)}</div></div>
     <div class="stat"><div class="k">σ · 标准差</div><div class="v">${fmtNum(r.std,2)}</div></div>
-    <div class="stat"><div class="k">K=1 上 / 下</div><div class="v2"><span class="hi">${fmtNum(r.k1u,2)}</span><div class="sep">/</div><span class="lo">${fmtNum(r.k1d,2)}</span></div></div>
-    <div class="stat"><div class="k">K=2 上 / 下</div><div class="v2"><span class="hi">${fmtNum(r.k2u,2)}</span><div class="sep">/</div><span class="lo">${fmtNum(r.k2d,2)}</span></div></div>
-    <div class="stat"><div class="k">K=3 上 / 下</div><div class="v2"><span class="hi">${fmtNum(r.k3u,2)}</span><div class="sep">/</div><span class="lo">${fmtNum(r.k3d,2)}</span></div></div>
+    ${band("中线 ±1σ（K=1）", r.k1d, r.k1u)}
+    ${band("中线 ±2σ（K=2）", r.k2d, r.k2u)}
+    ${band("中线 ±3σ（K=3）", r.k3d, r.k3u)}
     <div class="stat"><div class="k">中线日变动</div><div class="v ${deltaCls}">${r.midDelta>0?'+':''}${fmtNum(r.midDelta,2)}</div></div>
   `;
 
-  // expanding-window bands for chart
+  // 真滚动 MA(N)±kσ：后端多给的 warmup 让展示窗口第一根也凑得出完整的 N 根样本，
+  // 于是图上每一点的轨道都和右下角统计卡片同口径。老缓存没有 warmup 时，
+  // slice 的下界自动被 0 夹住，退化成改动前的逐日扩展窗口，不会报错也不会断线。
   const closes = r.closes;
-  const expandMean = i => { const w = closes.slice(0,i+1); return w.reduce((a,b)=>a+b,0)/w.length; };
-  const expandStd  = (i,m) => { const w = closes.slice(0,i+1); const v = w.reduce((s,x)=>s+(x-m)**2,0)/w.length; return Math.sqrt(v); };
-  const mids = closes.map((_,i)=> expandMean(i));
-  const k1u = closes.map((_,i)=> { const m=expandMean(i); return m + expandStd(i,m); });
-  const k1d = closes.map((_,i)=> { const m=expandMean(i); return m - expandStd(i,m); });
-  const k2u = closes.map((_,i)=> { const m=expandMean(i); return m + 2*expandStd(i,m); });
-  const k2d = closes.map((_,i)=> { const m=expandMean(i); return m - 2*expandStd(i,m); });
-  const k3u = closes.map((_,i)=> { const m=expandMean(i); return m + 3*expandStd(i,m); });
-  const k3d = closes.map((_,i)=> { const m=expandMean(i); return m - 3*expandStd(i,m); });
+  const warmup = Array.isArray(r.warmup) ? r.warmup : [];
+  const series = warmup.concat(closes);
+  const bands = closes.map((_, i) => {
+    const end = warmup.length + i + 1;
+    const w = series.slice(Math.max(0, end - PERIOD), end);
+    const m = avg(w);
+    const sd = Math.sqrt(w.reduce((s, x) => s + (x - m) ** 2, 0) / w.length);
+    return { m, sd };
+  });
+  const mids = bands.map(b => b.m);
+  const k1u = bands.map(b => b.m + b.sd);
+  const k1d = bands.map(b => b.m - b.sd);
+  const k2u = bands.map(b => b.m + 2 * b.sd);
+  const k2d = bands.map(b => b.m - 2 * b.sd);
+  const k3u = bands.map(b => b.m + 3 * b.sd);
+  const k3d = bands.map(b => b.m - 3 * b.sd);
 
-  document.getElementById("chart-legend").innerHTML = `
-    <span><i style="background:var(--c-price)"></i>收盘价</span>
-    <span><i style="background:var(--c-middle)"></i>中轨 MID</span>
-    <span><i style="background:var(--c-k1)"></i>±1σ (K=1)</span>
-    <span><i style="background:var(--c-k2)"></i>±2σ (K=2)</span>
-    <span><i style="background:var(--c-k3)"></i>±3σ (K=3)</span>
-  `;
+  document.getElementById("chart-legend").innerHTML =
+    ["price", "mid", "k1", "k2", "k3u", "k3d"]
+      .map(k => `<span><i style="color:${SERIES[k].color}"></i>${SERIES[k].label}</span>`)
+      .join("");
 
   if (chart) chart.destroy();
-  const dashed = [3,3], dotted = [1,3];
+  const dashed = [5,4], dotted = [2,3];
+  // 线型按“离中线多远”递进：中线虚线 → 1σ/2σ 短虚线 → 3σ 点线；收盘价最粗最实，压在最上层。
+  const bandLine = (label, data, color, dash) =>
+    ({ label, data, borderColor: color, borderWidth: 1.3, pointRadius: 0, pointHoverRadius: 0, borderDash: dash, tension: 0.25 });
   chart = new Chart(document.getElementById("chart"), {
     type: "line",
     data: {
       labels: DATES,
       datasets: [
-        { label:"K3上", data:k3u, borderColor:"#9333ea", borderWidth:1, pointRadius:0, borderDash:dotted },
-        { label:"K2上", data:k2u, borderColor:"#d97706", borderWidth:1, pointRadius:0, borderDash:dashed },
-        { label:"K1上", data:k1u, borderColor:"#16a34a", borderWidth:1, pointRadius:0 },
-        { label:"MID",  data:mids, borderColor:"#c2410c", borderWidth:1.8, pointRadius:0 },
-        { label:"K1下", data:k1d, borderColor:"#16a34a", borderWidth:1, pointRadius:0 },
-        { label:"K2下", data:k2d, borderColor:"#d97706", borderWidth:1, pointRadius:0, borderDash:dashed },
-        { label:"K3下", data:k3d, borderColor:"#9333ea", borderWidth:1, pointRadius:0, borderDash:dotted },
-        { label:"收盘", data:closes, borderColor:"#2b62e0", backgroundColor:"#2b62e0", borderWidth:2.2, pointRadius:2.5, tension:0.15 },
+        bandLine("K3 上", k3u, SERIES.k3u.color, dotted),
+        bandLine("K2 上", k2u, SERIES.k2.color, dashed),
+        bandLine("K1 上", k1u, SERIES.k1.color, dashed),
+        { label:"中线", data:mids, borderColor:SERIES.mid.color, borderWidth:2, pointRadius:0, pointHoverRadius:0, borderDash:dashed, tension:0.25 },
+        bandLine("K1 下", k1d, SERIES.k1.color, dashed),
+        bandLine("K2 下", k2d, SERIES.k2.color, dashed),
+        bandLine("K3 下", k3d, SERIES.k3d.color, dotted),
+        { label:"收盘价", data:closes, borderColor:SERIES.price.color, backgroundColor:SERIES.price.color,
+          borderWidth:2.6, pointRadius:0, pointHoverRadius:4, tension:0.25 },
       ]
     },
     options: {
@@ -850,13 +903,15 @@ function selectStock(code) {
         legend: { display: false },
         tooltip: {
           mode: "index", intersect: false, backgroundColor: "rgba(20,28,42,.92)",
+          padding: 10, boxPadding: 4,
           titleFont: { size: 11, weight: 600 }, bodyFont: { size: 11 },
           itemSort: (a,b)=> b.parsed.y - a.parsed.y,
+          callbacks: { label: (c) => ` ${c.dataset.label}  ${fmtNum(c.parsed.y, 2)}` },
         }
       },
       scales: {
-        x: { ticks: { autoSkip: true, maxTicksLimit: 8, font: { size: 10, family: 'var(--font)' }, color: '#6b7689' }, grid: { color: "#f1f3f7" } },
-        y: { ticks: { font: { size: 10, family: 'var(--font)' }, color: '#6b7689' }, grid: { color: "#f1f3f7" } },
+        x: { ticks: { autoSkip: true, maxTicksLimit: 8, font: { size: 10, family: 'var(--font)' }, color: '#6b7689' }, grid: { display: false } },
+        y: { ticks: { font: { size: 10, family: 'var(--font)' }, color: '#6b7689' }, grid: { color: "#f1f3f7" }, border: { display: false } },
       }
     }
   });

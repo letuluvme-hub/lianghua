@@ -1547,7 +1547,8 @@ async function fetchBkSectorRanking(env, bk, topN = SECTOR_TOP_N) {
 async function fetchSectorCloses(stock, days = SECTOR_LOOKBACK_DAYS, adjust = SECTOR_DEFAULT_ADJUST) {
   const symbol = `${stock.market === "1" ? "sh" : "sz"}${stock.code}`;
   const fq = adjust === "none" ? "" : adjust;
-  const param = `${symbol},day,,,${days + 10},${fq}`;
+  // 多取 N-1 根「热身」：前端要画真正的滚动 MA(N)±kσ，展示窗口的第一根也得凑得出完整的 N 根样本。
+  const param = `${symbol},day,,,${days * 2 + 10},${fq}`;
   const payload = await fetchJsonWithRetry(
     `https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=${param}`,
     { headers: { Accept: "application/json,text/plain,*/*" } },
@@ -1556,10 +1557,12 @@ async function fetchSectorCloses(stock, days = SECTOR_LOOKBACK_DAYS, adjust = SE
   const obj = payload?.data?.[symbol] || {};
   const rows = (fq && obj[`${fq}day`]) || obj.day || [];
   if (!rows.length) throw new Error(`${stock.code} 无K线数据`);
-  const bars = rows.slice(-days);
+  const bars = rows.slice(-(days * 2 - 1));
+  const cut = Math.max(0, bars.length - days); // 热身段长度；上市不足 2N-1 根时自动变短
   return {
-    dates: bars.map((b) => String(b[0])),
-    closes: bars.map((b) => Number(b[2])),
+    dates: bars.slice(cut).map((b) => String(b[0])),
+    closes: bars.slice(cut).map((b) => Number(b[2])),
+    warmup: bars.slice(0, cut).map((b) => Number(b[2])),
   };
 }
 
@@ -1580,7 +1583,7 @@ async function refreshSectorBollinger(env, bk, opts = {}) {
   const enriched = (
     await mapWithConcurrency(ranking, 5, async (s) => {
       try {
-        const { dates, closes } = await fetchSectorCloses(s, days, adjust);
+        const { dates, closes, warmup } = await fetchSectorCloses(s, days, adjust);
         if (!closes.length) return null;
         return {
           code: `${s.market === "1" ? "sh" : "sz"}${s.code}`,
@@ -1589,6 +1592,7 @@ async function refreshSectorBollinger(env, bk, opts = {}) {
           theme: s.theme || "",
           dates,
           closes,
+          warmup,
         };
       } catch (err) {
         console.warn(`[sector] kline failed ${s.code}:`, err?.message || err);
@@ -1623,6 +1627,8 @@ async function refreshSectorBollinger(env, bk, opts = {}) {
       mcap: s.mcap,
       ...(s.theme ? { theme: s.theme } : {}),
       closes: s.closes,
+      // 展示窗口之前的 N-1 根收盘，只用于把图上的轨道算成真滚动 MA(N)，不参与统计卡片
+      ...(s.warmup?.length ? { warmup: s.warmup } : {}),
     })),
   };
   const isDefault = days === SECTOR_LOOKBACK_DAYS && adjust === SECTOR_DEFAULT_ADJUST;
