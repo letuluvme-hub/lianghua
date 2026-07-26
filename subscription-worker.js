@@ -1305,14 +1305,17 @@ const SECTOR_BK_RE = /^BK\d{4,6}$/;
 const MAINLINE_BK = "ZX0001";
 const MAINLINE_NAME = "主线股票";
 const MAINLINE_BOARD_TOP = 8; // 取当日涨幅前 8 的概念板块作为「主线」
-const MAINLINE_PER_BOARD = 3; // 每条主线取涨幅前 3 的成分股
+const MAINLINE_MIN_BOARDS = 4; // 上涨板块少于这个数就放宽涨跌符号，见 fetchMainlineRanking
+const MAINLINE_PER_BOARD = 3; // 每条主线至少取涨幅前 3 的成分股
+const MAINLINE_PER_BOARD_MAX = 6; // 热点主线少时每条最多挖到第 6 名，避免整张表太单薄
 const MAINLINE_MIN_STOCKS = 5; // 少于这个数就用板块清单里的领涨股补位
 const MAINLINE_MIN_MCAP = 3e9; // 流通市值下限 30 亿（f21 单位为元），滤掉涨幅榜上的微盘噪音
 const SECTOR_ID_RE = /^(?:BK\d{4,6}|ZX\d{4})$/;
-// 东财「概念板块」里混着一批风格/标的类板块（融资融券标的、破净股、昨日涨停…），
-// 它们不是题材主线，涨幅又经常靠前，必须排除，否则主线板块会被这些噪音占满。
+// 东财「概念板块」里混着一批风格/技术形态/标的类板块（历史新高、昨日涨停、融资融券标的…），
+// 它们不是题材主线，涨幅又天然排在前面（本来就是按“涨得好”选出来的股票集合），
+// 不排掉的话主线板块会被这些噪音占满——实盘验证时前三条主线正是 历史新高/百日新高/近期新高。
 const MAINLINE_EXCLUDE_RE =
-  /融资融券|转融券|标的|股通|MSCI|富时|标普|ST|破净|昨日|今日|高送转|次新|重仓|QFII|社保|证金|参股|壳资源|举牌|回购|增持|减持|解禁|限售|百元股|茅指数|宁组合|国企改革|员工持股|同花顺|富时罗素/;
+  /新高|新低|涨停|跌停|连板|破净|破发|次新|高送转|送转|预增|预减|预盈|预亏|业绩|微盘|低价股|高价股|百元股|转债|融资融券|转融券|标的|股通|MSCI|富时|标普|ST|昨日|今日|重仓|QFII|社保|证金|参股|壳资源|举牌|回购|增持|减持|解禁|限售|茅指数|宁组合|国企改革|员工持股|同花顺/;
 const EASTMONEY_HOSTS = [
   "push2.eastmoney.com",
   "50.push2.eastmoney.com",
@@ -1406,14 +1409,23 @@ async function fetchMainlineRanking(env, topN = SECTOR_TOP_N) {
   // 1) 当日板块清单。清单本身已按当日涨幅降序，且 16:00 cron 会先刷它再刷各板块。
   //    正常情况下这里 0 个子请求：前端每次打开页面都会打 /api/sector-list，KV 里是热的。
   const { boards: allBoards } = await getSectorList(env);
-  const boards = (allBoards || [])
-    .filter((b) => b.type === "concept" && Number(b.pct) > 0 && !MAINLINE_EXCLUDE_RE.test(b.name))
-    .slice(0, MAINLINE_BOARD_TOP);
+  const concepts = (allBoards || []).filter(
+    (b) => b.type === "concept" && !MAINLINE_EXCLUDE_RE.test(b.name)
+  );
+  // 清单已按当日涨幅降序。常规交易日只取红盘板块；全市场普跌时红盘板块可能只剩一两个，
+  // 这时放宽涨跌符号取相对最强的几条——主线看的是相对强度，收红不是必要条件。
+  const rising = concepts.filter((b) => Number(b.pct) > 0);
+  const boards = (rising.length >= MAINLINE_MIN_BOARDS ? rising : concepts).slice(0, MAINLINE_BOARD_TOP);
   if (!boards.length) throw new Error("暂时没有取到当日热点板块，无法合成主线股票");
 
-  // 2) 每条主线取涨幅龙头。只用前 2 个分片：fetchJsonWithRetry 每个 URL 重试 2 次，
-  //    5 个 host 就是 10 次子请求，叠加清单翻页和 20 只成分股 K 线会撞上 Worker 子请求上限。
-  //    多取几只再筛（ST/北交所/微盘会淘汰掉一部分），子请求数不变。
+  // 2) 每条主线取涨幅龙头。取几只随主线条数自适应：普跌日红盘概念板块可能只剩三四条，
+  //    仍按每条 3 只就凑不满一张表，这时往下多挖几名（clist 本来就一次拿 10 条，不多发请求）。
+  const perBoardTake = Math.min(
+    MAINLINE_PER_BOARD_MAX,
+    Math.max(MAINLINE_PER_BOARD, Math.ceil(topN / boards.length))
+  );
+  // 只用前 2 个分片：fetchJsonWithRetry 每个 URL 重试 2 次，5 个 host 就是 10 次子请求，
+  // 叠加清单翻页和 20 只成分股 K 线会撞上 Worker 子请求上限。
   const hosts = EASTMONEY_HOSTS.slice(0, 2);
   const perBoard = await mapWithConcurrency(boards, 3, async (board) => {
     try {
@@ -1439,7 +1451,7 @@ async function fetchMainlineRanking(env, topN = SECTOR_TOP_N) {
           theme: board.name,
         }))
         .filter(isUsableMainlineStock)
-        .slice(0, MAINLINE_PER_BOARD);
+        .slice(0, perBoardTake);
     } catch (err) {
       console.warn(`[mainline] board ${board.bk} constituents failed:`, err?.message || err);
       return [];
@@ -1456,7 +1468,7 @@ async function fetchMainlineRanking(env, topN = SECTOR_TOP_N) {
     seen.add(s.code); // 同股跨板块去重：先命中的（更热的主线）胜出
     ranking.push(s);
   };
-  for (let r = 0; r < MAINLINE_PER_BOARD && ranking.length < topN; r += 1) {
+  for (let r = 0; r < perBoardTake && ranking.length < topN; r += 1) {
     perBoard.forEach((stocks) => take(stocks[r]));
   }
 
