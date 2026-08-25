@@ -1,3 +1,5 @@
+import { generateAlertInterpretation } from "./ai-interpreter.js";
+
 const WATCHLIST = {
   "688256": { name: "寒武纪" },
   "688802": { name: "沐曦股份" },
@@ -303,6 +305,8 @@ async function fetchStockSnapshot(code, period) {
     code: normalizedCode,
     name: payload.data.name || (await fetchSecurityName(code)),
     ...bands,
+    // 纯新增字段，供 AI 解读模块参考近期走势；现有消费方不受影响。
+    recentCloses: rows.slice(-20).map((row) => ({ date: row.date, close: row.close })),
   };
 }
 
@@ -921,7 +925,7 @@ function evaluateAlert(snapshot, subscription) {
   };
 }
 
-function renderAlertEmail(subscription, alerts) {
+function renderAlertEmail(subscription, alerts, aiHtml = null) {
   const rows = alerts
     .map(
       (item) => `
@@ -951,7 +955,7 @@ function renderAlertEmail(subscription, alerts) {
           </tr>
         </thead>
         <tbody>${rows}</tbody>
-      </table>
+      </table>${aiHtml || ""}
       <p style="color:#64748b;font-size:12px;">同一邮箱、同一股票、同一规则在同一交易日只发送一次预警。</p>
     </div>
   `;
@@ -991,8 +995,8 @@ function renderAlertConfirmationEmail(subscription, snapshots) {
   `;
 }
 
-async function sendAlertEmail(env, subscription, alerts, subjectPrefix = "日布林带预警") {
-  return sendResendEmail(env, subscription.email, `${subjectPrefix} ${currentShanghaiParts().date}`, renderAlertEmail(subscription, alerts));
+async function sendAlertEmail(env, subscription, alerts, subjectPrefix = "日布林带预警", aiHtml = null) {
+  return sendResendEmail(env, subscription.email, `${subjectPrefix} ${currentShanghaiParts().date}`, renderAlertEmail(subscription, alerts, aiHtml));
 }
 
 async function handleSubscribe(request, env) {
@@ -1199,7 +1203,9 @@ async function sendDueAlerts(env, force = false) {
         continue;
       }
 
-      await sendAlertEmail(env, subscription, newAlerts);
+      // 内部永不 throw：AI 不可用时返回 null，邮件按原样发送。
+      const aiHtml = await generateAlertInterpretation(env, subscription, newAlerts);
+      await sendAlertEmail(env, subscription, newAlerts, undefined, aiHtml);
       const nextKeys = [...sentKeys, ...newAlerts.map((alert) => alert.alertKey)].slice(-300);
       subscription.lastAlertKeys = nextKeys;
       subscription.lastAlertAt = new Date().toISOString();
