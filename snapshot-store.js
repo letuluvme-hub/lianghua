@@ -350,11 +350,16 @@ async function ensureSchema(env) {
 }
 
 // 每批 ≤ BATCH_SIZE 条语句提交，返回实际提交的语句（行）数。
-async function runBatched(env, statements) {
+// onCommit 在每批成功后回调：中途抛错时，已经落库的批次仍被如实计入行数统计。
+async function runBatched(env, statements, onCommit) {
+  let committed = 0;
   for (let i = 0; i < statements.length; i += BATCH_SIZE) {
-    await env.DB.batch(statements.slice(i, i + BATCH_SIZE));
+    const chunk = statements.slice(i, i + BATCH_SIZE);
+    await env.DB.batch(chunk);
+    committed += chunk.length;
+    if (onCommit) onCommit(chunk.length);
   }
-  return statements.length;
+  return committed;
 }
 
 // ---------------------------------------------------------------------------
@@ -416,18 +421,60 @@ async function collectUniverse(env) {
 
 const backfillMemoKey = (code) => `snap:bf:${code}`;
 
-// 是否已完成回填：优先看 KV memo（回填全部批次成功后才写），KV 不可用时退回 D1 计数。
+/**
+ * 单次运行的写入预算。
+ *
+ * reserve() 全程同步（内部没有 await），因此 mapWithConcurrency 并发拉取时
+ * 不会出现多只股票同时越过上限——「先查 remaining 再写、写完才记账」那种写法
+ * 会让并发的每个 worker 都读到同一个旧余额，实测能超出上限数十倍。
+ */
+function createWriteBudget(maxRows) {
+  let reserved = 0; // 已预定（含尚未提交）的行数，用于封顶
+  let written = 0; // 实际提交成功的行数，用于 snapshot_runs.rows_written
+  let deepAdmitted = false; // 本轮是否已有回填被放行
+  return {
+    written: () => written,
+    commit(rows) {
+      written += rows;
+    },
+    /**
+     * 预定 rows 行额度；返回 false 表示这只股票整只跳过、留给下次 cron 续跑
+     * （绝不写半只股票的历史，「daily_bars 中该 code 无记录即未回填完成」才成立）。
+     *
+     * 例外：本轮还没有任何回填被放行时，允许一只超预算的回填落地。否则已回填股票
+     * 的增量写入会先吃掉预算，剩下那些「单只体量就大于单轮预算」的股票永远排不上队。
+     */
+    reserve(rows, deep) {
+      if (rows <= maxRows - reserved) {
+        reserved += rows;
+        if (deep) deepAdmitted = true;
+        return true;
+      }
+      if (deep && !deepAdmitted) {
+        reserved += rows;
+        deepAdmitted = true;
+        return true;
+      }
+      return false;
+    },
+  };
+}
+
+// 是否已完成回填。基准判据来自 D1 本身（计划 §3：daily_bars 中该 code 无记录即未回填完成），
+// KV memo 只作为附加条件收紧它：回填要跨多个 batch 提交，中途失败会留下「有行但不完整」的
+// 历史，memo 只在全部批次成功后才写，两者同时成立才算回填完成。
+// 反过来也必须成立——D1 被重建（换库 / DISABLE_D1 往返）后 memo 仍在，若只信 memo
+// 就会退化成每天只写 5 行，历史再也补不回来。
 async function isBackfilled(env, code) {
+  const row = await env.DB.prepare("SELECT COUNT(*) AS c FROM daily_bars WHERE code = ?").bind(code).first();
+  if (Number(row?.c || 0) === 0) return false;
+  if (!env.SUBSCRIPTIONS) return true; // 没有 KV 可用时退回纯 D1 判据
   try {
-    if (env.SUBSCRIPTIONS) {
-      const memo = await env.SUBSCRIPTIONS.get(backfillMemoKey(code));
-      if (memo) return true;
-    }
+    return Boolean(await env.SUBSCRIPTIONS.get(backfillMemoKey(code)));
   } catch (err) {
     console.warn(`[snapshot] backfill memo read failed ${code}:`, err?.message || err);
+    return true; // memo 读不到时按已回填处理，避免每天重复全量回填打爆写入预算
   }
-  const row = await env.DB.prepare("SELECT COUNT(*) AS c FROM daily_bars WHERE code = ?").bind(code).first();
-  return Number(row?.c || 0) > 0;
 }
 
 /**
@@ -454,14 +501,13 @@ async function persistStock(env, code, periods, budget) {
       );
     }
   }
-  // 预算不够放下整只股票 → 整只跳过，避免半截写入；下次 cron 自动续跑。
-  // 例外：本次运行还一行没写时无条件写入，否则单只股票大于总预算会永远卡住。
-  if (statements.length > budget.remaining() && budget.spent() > 0) {
+  // 开写之前先按实际行数预定额度：装不下就整只跳过，绝不写半只股票的历史，
+  // 下次 cron 凭「daily_bars 中该 code 无记录」自动续跑，无需额外进度表。
+  if (!budget.reserve(statements.length, deep)) {
     return { written: 0, skippedForBudget: true };
   }
 
-  const written = await runBatched(env, statements);
-  budget.spend(written);
+  const written = await runBatched(env, statements, (rows) => budget.commit(rows));
   if (deep && env.SUBSCRIPTIONS) {
     // 全部批次成功后才落 memo：中途失败下次仍会重新回填。
     await env.SUBSCRIPTIONS.put(backfillMemoKey(code), bars[0].date).catch((err) =>
@@ -497,16 +543,9 @@ export async function runDailySnapshot(env, opts = {}) {
     await ensureSchema(env);
     const { codes, periods, dropped } = await collectUniverse(env);
 
-    let spent = 0;
     // 上限默认 MAX_ROWS_PER_RUN，可用环境变量 SNAPSHOT_MAX_ROWS 覆盖（验收 §8 的截停验证用）。
     const maxRows = Number(env.SNAPSHOT_MAX_ROWS) > 0 ? Number(env.SNAPSHOT_MAX_ROWS) : MAX_ROWS_PER_RUN;
-    const budget = {
-      spent: () => spent,
-      remaining: () => maxRows - spent,
-      spend: (rows) => {
-        spent += rows;
-      },
-    };
+    const budget = createWriteBudget(maxRows);
 
     let ok = 0;
     let failed = 0;
@@ -533,7 +572,8 @@ export async function runDailySnapshot(env, opts = {}) {
       .filter(Boolean)
       .join(" ");
     const finishedAt = new Date().toISOString();
-    await env.DB.prepare(UPSERT_RUN).bind(runDate, startedAt, finishedAt, ok, failed, spent, note).run();
+    const rowsWritten = budget.written();
+    await env.DB.prepare(UPSERT_RUN).bind(runDate, startedAt, finishedAt, ok, failed, rowsWritten, note).run();
 
     // 还有股票因预算被跳过时不写 memo，让下一次 cron 继续跑完。
     if (env.SUBSCRIPTIONS && budgetSkipped === 0) {
@@ -545,7 +585,7 @@ export async function runDailySnapshot(env, opts = {}) {
       finished_at: finishedAt,
       stocks_ok: ok,
       stocks_failed: failed,
-      rows_written: spent,
+      rows_written: rowsWritten,
       note,
     };
   } catch (err) {
