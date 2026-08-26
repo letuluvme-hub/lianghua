@@ -1,15 +1,18 @@
-// 部署「子路径挂载」代理 Worker（path-proxy-worker.js）。
+// 部署站点代理 Worker（path-proxy-worker.js）。
 //
-// 用途：把 Pages 站点挂到国内可达的自有域名子路径下，例如 https://solmate.top/boll。
-// 本脚本只负责上传 Worker 脚本本身；最后一步「绑定路由」需要 zone 级
-// Workers Routes 权限，用带该权限的令牌运行本脚本时会自动完成，
-// 否则脚本会打印出需要在 Cloudflare 面板手动添加的路由，其余步骤照常成功。
+// 用途：把 Pages 站点挂到国内可达的自有域名上（*.pages.dev 在国内不可达）。
+//
+// 线上形态：Worker `boll-path-proxy` 绑 Custom Domain `boll.fangtuo.top`，
+// 整站挂载（默认）。Custom Domain 在 Cloudflare 面板上绑定，本脚本不涉及。
+//
+// 也支持子路径挂载：PROXY_PREFIX=/boll PROXY_ZONE=solmate.top 时会去绑
+// route；该步骤需要 zone 级 Workers Routes 权限，令牌没有时脚本不失败，
+// 改为打印需手动添加的路由。
 //
 // 环境变量：
 //   CLOUDFLARE_ACCOUNT_ID / CLOUDFLARE_API_TOKEN  必填
-//   PROXY_ZONE      默认 solmate.top      —— 挂载到哪个域名（仅 route 模式用）
-//   PROXY_PREFIX    默认 /boll            —— 挂载到哪个子路径；
-//                                          留空表示整个主机名挂载（用 Custom Domain 绑定，无需 route）
+//   PROXY_PREFIX    默认空（整站挂载）  —— 设为 /boll 之类则改为子路径挂载
+//   PROXY_ZONE      默认 solmate.top   —— 子路径挂载时绑 route 用，整站模式忽略
 //   PAGES_ORIGIN    默认 Pages 站点地址   —— 回源地址
 //   PROXY_SCRIPT    默认 boll-path-proxy  —— Worker 脚本名
 
@@ -20,7 +23,7 @@ const apiToken = process.env.CLOUDFLARE_API_TOKEN;
 const zoneName = process.env.PROXY_ZONE || "solmate.top";
 // 留空（PROXY_PREFIX= 或 PROXY_PREFIX=/）表示整个主机名挂载：
 // 这种模式下用 Worker 的 Custom Domain 绑定，不需要 route。
-const rawPrefix = String(process.env.PROXY_PREFIX ?? "/boll").replace(/^\/+|\/+$/g, "");
+const rawPrefix = String(process.env.PROXY_PREFIX ?? "").replace(/^\/+|\/+$/g, "");
 const prefix = rawPrefix ? `/${rawPrefix}` : "";
 const pagesOrigin = process.env.PAGES_ORIGIN || "https://cambricon-boll-midline.pages.dev";
 const scriptName = process.env.PROXY_SCRIPT || "boll-path-proxy";

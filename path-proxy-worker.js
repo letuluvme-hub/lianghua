@@ -1,11 +1,14 @@
-// 把 Pages 站点挂到已有域名的子路径下（例：https://solmate.top/boll）。
+// 把 Pages 站点挂到国内可达的自有域名上。
 //
-// 背景：*.pages.dev 与 *.workers.dev 在国内不可达，而 solmate.top 已经走
-// Cloudflare 代理指向自建 nginx。给这个 Worker 绑一条路由 `solmate.top/boll*`，
-// 即可用国内可达的域名访问同一个站点，其余路径仍归 nginx，互不影响。
+// 背景：*.pages.dev 与 *.workers.dev 在国内不可达。本 Worker 反向代理到
+// Pages 站点，绑上自有域名后即可正常访问。
+//
+// 当前线上形态：Custom Domain = boll.fangtuo.top，整站挂载（PREFIX 为空）。
+// 也支持子路径挂载（PREFIX="/boll" + route，如 solmate.top/boll），
+// 那种模式下会剥掉前缀回源。
 //
 // 前端资源用相对路径（./styles.css 等），API_BASE 也跟随当前路径前缀，
-// 所以这里只需剥掉前缀转发，无需改写响应正文。
+// 所以两种模式都无需改写响应正文。
 //
 // 可用 plain_text binding 覆盖：
 //   PAGES_ORIGIN —— 回源地址
@@ -13,7 +16,9 @@
 //                   给 Worker 绑 Custom Domain（如 boll.fangtuo.top）时用这种。
 
 const DEFAULT_PAGES_ORIGIN = "https://cambricon-boll-midline.pages.dev";
-const DEFAULT_PREFIX = "/boll";
+// 默认整站挂载，与线上 boll.fangtuo.top 的形态一致；
+// 子路径挂载时用 PREFIX binding 显式指定（如 "/boll"）。
+const DEFAULT_PREFIX = "";
 
 // "" 或 "/" → 整个主机名挂载（Custom Domain 模式）；否则返回 "/前缀"（route 模式）。
 function normalizePrefix(value) {
