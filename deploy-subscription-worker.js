@@ -79,9 +79,14 @@ async function uploadWorker(namespaceId) {
   pushSecret("RESEND_API_KEY", resendApiKey, { legacy: true });
   pushSecret("RESEND_FROM_EMAIL", process.env.RESEND_FROM_EMAIL ? resendFromEmail : "", { legacy: true });
   pushSecret("ALERT_SECRET", process.env.ALERT_SECRET, { legacy: true });
-  // AI 解读模块所需（可选）：未配置时 Worker 侧自动关闭该功能，预警邮件按原样发送。
+  // AI 解读模块所需（全部可选）：一个 key 都没有时 Worker 侧自动关闭该功能，
+  // 预警邮件按原样发送。两家 key 都配了就用 AI_PROVIDER 指定用哪家。
+  pushSecret("DEEPSEEK_API_KEY", process.env.DEEPSEEK_API_KEY);
+  pushSecret("DEEPSEEK_MODEL", process.env.DEEPSEEK_MODEL);
+  pushSecret("DEEPSEEK_BASE_URL", process.env.DEEPSEEK_BASE_URL);
   pushSecret("ANTHROPIC_API_KEY", process.env.ANTHROPIC_API_KEY);
   pushSecret("ANTHROPIC_MODEL", process.env.ANTHROPIC_MODEL);
+  pushSecret("AI_PROVIDER", process.env.AI_PROVIDER);
   const metadata = {
     main_module: workerFile,
     compatibility_date: "2026-05-23",
@@ -99,10 +104,37 @@ async function uploadWorker(namespaceId) {
     );
   }
 
-  return api(`/accounts/${accountId}/workers/scripts/${scriptName}`, {
+  await api(`/accounts/${accountId}/workers/scripts/${scriptName}`, {
     method: "PUT",
     body: formData,
   });
+  // 返回本次实际写入的 binding 名单，供部署结果里说明 AI 解读是开是关。
+  return new Set(bindings.map((binding) => binding.name));
+}
+
+let existingBindingNamesForReport = new Set();
+
+// 部署结果里的一行人话：AI 解读用了哪家、是不是关着。
+function describeAiBinding(names) {
+  const hasDeepSeek = names.has("DEEPSEEK_API_KEY");
+  const hasAnthropic = names.has("ANTHROPIC_API_KEY");
+  if (!hasDeepSeek && !hasAnthropic) {
+    return "disabled (set DEEPSEEK_API_KEY or ANTHROPIC_API_KEY to enable)";
+  }
+  const requested = (process.env.AI_PROVIDER || "").trim().toLowerCase();
+  const active =
+    requested === "anthropic" && hasAnthropic
+      ? "anthropic"
+      : requested === "deepseek" && hasDeepSeek
+        ? "deepseek"
+        : hasDeepSeek
+          ? "deepseek"
+          : "anthropic";
+  const model =
+    active === "deepseek"
+      ? process.env.DEEPSEEK_MODEL || "deepseek-v4-flash (default)"
+      : process.env.ANTHROPIC_MODEL || "claude-opus-5 (default)";
+  return `enabled via ${active} (${model})`;
 }
 
 async function enableWorkersDev() {
@@ -128,7 +160,7 @@ async function main() {
     throw new Error("CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN are required.");
   }
   const namespace = await ensureKvNamespace();
-  await uploadWorker(namespace.id);
+  existingBindingNamesForReport = await uploadWorker(namespace.id);
   const workerUrl = await enableWorkersDev();
   await setSchedule();
   console.log(
@@ -138,7 +170,7 @@ async function main() {
         kvNamespace: namespace.title,
         workerUrl,
         resendFromEmail,
-        aiInterpreter: process.env.ANTHROPIC_API_KEY ? "enabled (key updated)" : "unchanged (see ANTHROPIC_API_KEY)",
+        aiInterpreter: describeAiBinding(existingBindingNamesForReport),
         schedule: "* * * * *",
       },
       null,

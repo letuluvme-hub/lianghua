@@ -37,7 +37,7 @@ export async function generateAlertInterpretation(env, subscription, alerts)
 
 ### 2.2 内部行为
 
-1. **开关判定**：`env.ANTHROPIC_API_KEY` 未配置 → 立即返回 `null`（功能整体关闭，零成本、零副作用）。
+1. **开关判定**：一个 API Key 都没配 → 立即返回 `null`（功能整体关闭，零成本、零副作用）。供应商选择见 §7。
 2. **KV 缓存**：key 为 `ai:alert:${date}:${hash}`，`hash` 由 alerts 的 `alertKey` 列表（排序后）+
    `subscription.period/multiplier/condition` 拼接求 FNV-1a 短哈希（自实现，不引依赖）。
    命中直接返回；未命中调 API 后 `put(key, html, { expirationTtl: 86400 })`。
@@ -91,7 +91,7 @@ alert 只挑需要的字段（name/code/date/close/middle/standardDeviation/side
 1. **多模块上传**：metadata 的 `main_module` 仍是 `subscription-worker.js`，
    multipart 中额外追加 `ai-interpreter.js` 分片（`application/javascript+module`），
    模块名与 Worker 里的相对 import 说明符一致。
-2. **两个新 binding**（都可选）：`ANTHROPIC_API_KEY`、`ANTHROPIC_MODEL`。
+2. **新 binding**（都可选，见 §7 完整清单）：`ANTHROPIC_API_KEY`、`ANTHROPIC_MODEL` 等。
    沿用既有语义：显式提供环境变量 → `secret_text` 覆盖；否则 `inherit` 继承上次部署的值。
 3. **inherit 安全性**：上传前先查 `GET /workers/scripts/{name}/settings` 拿到已有 binding 名单，
    只对确实存在的 binding 发 `inherit`（inherit 一个不存在的 binding 会让整次上传失败）。
@@ -144,3 +144,54 @@ Resend 收到的 HTML 中解读块位于表格之后、灰色注释行之前；`
   届时可调高该常量或改用 `env.ANTHROPIC_MODEL` 指定更便宜/更短的模型。
 - 成本：单封邮件一次调用，约 1.5K 入 + 0.5K 出，`claude-opus-5`（$5/$25 每百万 token）下不到 $0.02；
   KV 缓存使同规则同日的多个订阅者共用一次调用。
+
+## 7. 多供应商支持（DeepSeek / Anthropic）
+
+初版只支持 Anthropic。为支持 DeepSeek，模块内引入一层极薄的 provider 抽象
+（`pickProvider` / `deepseekProvider` / `anthropicProvider`），
+缓存、HTML 转义、免责声明、"永不 throw" 等公共逻辑完全复用，
+`subscription-worker.js` **一行未改**。
+
+### 7.1 环境变量（部署时传给 `deploy-subscription-worker.js`）
+
+| 变量 | 作用 |
+|------|------|
+| `DEEPSEEK_API_KEY` | DeepSeek API Key。配了就用 DeepSeek |
+| `DEEPSEEK_MODEL` | 可选，默认 `deepseek-v4-flash`（便宜）；更强可用 `deepseek-v4-pro` |
+| `DEEPSEEK_BASE_URL` | 可选，默认 `https://api.deepseek.com`；走代理/中转时改这里 |
+| `ANTHROPIC_API_KEY` | Anthropic API Key |
+| `ANTHROPIC_MODEL` | 可选，默认 `claude-opus-5` |
+| `AI_PROVIDER` | 可选，`deepseek` / `anthropic`。仅在两家 key 都配了时用来指定 |
+
+选择顺序：`AI_PROVIDER` 指定且对应 key 存在 → 用它；否则有 `DEEPSEEK_API_KEY` → DeepSeek；
+否则有 `ANTHROPIC_API_KEY` → Anthropic；都没有 → 功能关闭。
+`AI_PROVIDER` 写错或指向一个没配 key 的供应商时，记一条 warn 后按 key 回落，不会中断发信。
+
+### 7.2 DeepSeek 请求形态
+
+OpenAI 兼容：`POST {baseUrl}/chat/completions`，`Authorization: Bearer <key>`，
+body 为 `{ model, max_tokens: 2000, stream: false, messages: [{role:"system"},{role:"user"}] }`；
+读 `choices[0].message.content`，`finish_reason === "content_filter"` 视为拒答返回 `null`。
+Anthropic 分支保持原样（`x-api-key` + `anthropic-version` + `fallbacks: "default"`）。
+
+### 7.3 缓存键
+
+KV key 的哈希种子加入了 `provider/model`，因此换供应商或换模型后不会读到上一个模型留下的解读。
+
+### 7.4 验收记录（多供应商改造）
+
+同样全部以 mock 完成，未产生真实 API 调用与费用。
+
+| 场景 | 结果 |
+|------|------|
+| 仅 `DEEPSEEK_API_KEY` | 命中 `https://api.deepseek.com/chat/completions`，Bearer 鉴权，`model=deepseek-v4-flash`、`stream=false`、system+user 两条消息 |
+| `DEEPSEEK_MODEL` / `DEEPSEEK_BASE_URL` 覆盖 | 模型与 URL 均生效（含 base URL 末尾斜杠归一化） |
+| 仅 `ANTHROPIC_API_KEY` | 仍走 Anthropic，行为与初版一致 |
+| 两家 key 都有，无 `AI_PROVIDER` | 用 DeepSeek |
+| 两家 key 都有，`AI_PROVIDER=anthropic` | 用 Anthropic |
+| `AI_PROVIDER` 指向没配 key 的一家 / 写成未知值 | warn 后回落到有 key 的一家 |
+| 一个 key 都没有 | 返回 null，不发任何请求 |
+| 缓存 | 同模型第二次命中缓存不再请求；换模型后重新请求，两条独立缓存 |
+| `content_filter` / 空文本 / 无 `choices` / HTTP 402 / 网络异常 / 非 JSON 响应 | 一律返回 null，邮件照常发送 |
+| KV 读写全部抛异常 | 仍返回解读 |
+| 部署脚本 | 6 种场景干跑，binding 组合与 `aiInterpreter` 状态行均符合预期 |
