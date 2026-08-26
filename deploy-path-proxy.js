@@ -7,8 +7,9 @@
 //
 // 环境变量：
 //   CLOUDFLARE_ACCOUNT_ID / CLOUDFLARE_API_TOKEN  必填
-//   PROXY_ZONE      默认 solmate.top      —— 挂载到哪个域名
-//   PROXY_PREFIX    默认 /boll            —— 挂载到哪个子路径
+//   PROXY_ZONE      默认 solmate.top      —— 挂载到哪个域名（仅 route 模式用）
+//   PROXY_PREFIX    默认 /boll            —— 挂载到哪个子路径；
+//                                          留空表示整个主机名挂载（用 Custom Domain 绑定，无需 route）
 //   PAGES_ORIGIN    默认 Pages 站点地址   —— 回源地址
 //   PROXY_SCRIPT    默认 boll-path-proxy  —— Worker 脚本名
 
@@ -17,7 +18,10 @@ const fs = require("node:fs/promises");
 const accountId = process.env.CLOUDFLARE_ACCOUNT_ID;
 const apiToken = process.env.CLOUDFLARE_API_TOKEN;
 const zoneName = process.env.PROXY_ZONE || "solmate.top";
-const prefix = `/${(process.env.PROXY_PREFIX || "/boll").replace(/^\/+|\/+$/g, "")}`;
+// 留空（PROXY_PREFIX= 或 PROXY_PREFIX=/）表示整个主机名挂载：
+// 这种模式下用 Worker 的 Custom Domain 绑定，不需要 route。
+const rawPrefix = String(process.env.PROXY_PREFIX ?? "/boll").replace(/^\/+|\/+$/g, "");
+const prefix = rawPrefix ? `/${rawPrefix}` : "";
 const pagesOrigin = process.env.PAGES_ORIGIN || "https://cambricon-boll-midline.pages.dev";
 const scriptName = process.env.PROXY_SCRIPT || "boll-path-proxy";
 const workerFile = "path-proxy-worker.js";
@@ -83,21 +87,27 @@ async function main() {
   }
   await uploadWorker();
 
-  let routes;
+  // 整站挂载模式不需要 route：主机名由 Worker 的 Custom Domain 绑定。
+  let routes = null;
   let routeError = null;
-  try {
-    routes = await ensureRoutes();
-  } catch (error) {
-    routeError = error;
+  if (prefix) {
+    try {
+      routes = await ensureRoutes();
+    } catch (error) {
+      routeError = error;
+    }
   }
 
   const result = {
     scriptName,
-    mountedAt: `https://${zoneName}${prefix}`,
+    mode: prefix ? "子路径挂载（route）" : "整个主机名挂载（Custom Domain）",
+    mountedAt: prefix ? `https://${zoneName}${prefix}` : "由 Worker 的 Custom Domain 决定",
     pagesOrigin,
     workerUploaded: true,
   };
-  if (routes) {
+  if (!prefix) {
+    result.routes = "不适用（Custom Domain 模式）";
+  } else if (routes) {
     result.routes = { added: routes.added, alreadyPresent: routes.alreadyPresent };
   } else {
     result.routes = "FAILED — 令牌缺少 zone 级 Workers Routes 权限";

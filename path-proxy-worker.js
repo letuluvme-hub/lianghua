@@ -7,30 +7,43 @@
 // 前端资源用相对路径（./styles.css 等），API_BASE 也跟随当前路径前缀，
 // 所以这里只需剥掉前缀转发，无需改写响应正文。
 //
-// 可用 plain_text binding 覆盖：PAGES_ORIGIN、PREFIX。
+// 可用 plain_text binding 覆盖：
+//   PAGES_ORIGIN —— 回源地址
+//   PREFIX       —— 子路径前缀；留空（或 "/"）表示整个主机名挂载，
+//                   给 Worker 绑 Custom Domain（如 boll.fangtuo.top）时用这种。
 
 const DEFAULT_PAGES_ORIGIN = "https://cambricon-boll-midline.pages.dev";
 const DEFAULT_PREFIX = "/boll";
 
+// "" 或 "/" → 整个主机名挂载（Custom Domain 模式）；否则返回 "/前缀"（route 模式）。
+function normalizePrefix(value) {
+  const trimmed = String(value ?? "").replace(/^\/+|\/+$/g, "");
+  return trimmed ? `/${trimmed}` : "";
+}
+
 export default {
   async fetch(request, env) {
     const origin = (env?.PAGES_ORIGIN || DEFAULT_PAGES_ORIGIN).replace(/\/+$/, "");
-    const prefix = `/${(env?.PREFIX || DEFAULT_PREFIX).replace(/^\/+|\/+$/g, "")}`;
+    // PREFIX 为空（或 "/"）表示整个主机名挂载 —— 给 Worker 绑 Custom Domain 时用这种；
+    // 非空则是子路径挂载（route 模式），例如 solmate.top/boll。
+    const prefix = normalizePrefix(env?.PREFIX ?? DEFAULT_PREFIX);
     const url = new URL(request.url);
 
-    // /boll → /boll/：带上尾斜杠，相对路径（./app.js）才能解析到 /boll/ 之下。
-    if (url.pathname === prefix) {
-      return new Response(null, {
-        status: 308,
-        headers: { location: `${prefix}/${url.search}` },
-      });
-    }
-    if (!url.pathname.startsWith(`${prefix}/`)) {
-      return new Response("Not found", { status: 404 });
+    if (prefix) {
+      // /boll → /boll/：带上尾斜杠，相对路径（./app.js）才能解析到 /boll/ 之下。
+      if (url.pathname === prefix) {
+        return new Response(null, {
+          status: 308,
+          headers: { location: `${prefix}/${url.search}` },
+        });
+      }
+      if (!url.pathname.startsWith(`${prefix}/`)) {
+        return new Response("Not found", { status: 404 });
+      }
     }
 
     const target = new URL(origin);
-    target.pathname = url.pathname.slice(prefix.length) || "/";
+    target.pathname = prefix ? url.pathname.slice(prefix.length) || "/" : url.pathname;
     target.search = url.search;
 
     const init = { method: request.method, headers: request.headers, redirect: "manual" };
