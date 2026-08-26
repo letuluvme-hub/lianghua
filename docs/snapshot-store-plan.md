@@ -141,8 +141,187 @@ export async function handleSnapshotHistory(request, env)   // GET /api/snapshot
 
 ---
 
-# 验收记录（实现后补充）
+# 验收记录一：初版实现（#4 / #5 / #6）
 
+## 实现落点
+
+| 文件 | 改动 |
+|------|------|
+| `snapshot-store.js` | 新建，672 行，零依赖、无 import 主 Worker |
+| `subscription-worker.js` | +17 −3 行，严格限于 §5 的 5 个挂钩点 |
+| `deploy-subscription-worker.js` | +24 −3 行，`ensureD1Database()` + d1 binding + 模块注册 + 输出字段 + `DISABLE_D1` |
+
+`subscription-worker.js` 的 3 行删除全部来自挂钩点 3——把 `refreshSectorBollinger(env, bk).catch(...)` 改写成
+`.then(persistSectorSnapshot).catch(...)` 的链式换行，没有任何现有函数体被改动。
+
+## 实现中的判断与偏离说明
+
+### 1. 板块合成口径：等权算术平均收盘价（计划要求"与前端一致"，但前端并不存在该口径）
+
+按 §4 的要求先读了 `sectors.html`：该页面**只逐只展示成分股各自的布林带**（`stats(s.closes)` 对每只股票独立计算
+中线/标准差/K1–K3），**没有任何"板块合成指数"**，`mcap` 只用于 TopN 选股和表格展示。因此不存在可对齐的既有口径，
+需要在本模块里定下一个。选择**等权算术平均收盘价**（当日全部有收盘价的成分股收盘价的简单平均），理由：
+
+- **时序可比性**：payload 里的 `mcap` 只有"当日快照"一个值。若用它做权重，同一个 `trade_date` 的指数值会随
+  运行日漂移（每天重写最近 5 日时权重都不同），落库后的序列不可比。等权平均对给定
+  `(bk, trade_date, 成分集合)` 完全确定，重复运行结果逐位一致。
+- **与前端精神一致**：前端把 20 只成分股平等对待，等权是它最自然的聚合。
+- **成分变动可识别**：TopN 名单换血会让指数跳变，`member_count` 列把这一点显式记录下来，
+  后续做板块轮动强度时可以据此剔除跳变点。
+
+若将来需要市值加权，正确做法是先落一张按日的 `sector_members(bk, trade_date, code, mcap)`，而不是拿当日快照
+去回溯加权——那属于后续步骤，本次不做。
+
+**右对齐**：`payload.stocks[].closes` 只给数组不给逐只日期，长度可能短于公共横轴 `dates`（停牌/次新）。
+本模块按"最后一根 K 线对齐最新交易日"右对齐（`offset = dates.length - closes.length`），比前端图表隐含的
+左对齐更准确；两者在长度一致的常规情况下完全等价。
+
+### 2. `bandwidth_pct` 存的是比值不是百分数
+
+按 §2 给出的公式 `4*stddev/middle` 实现（K=2 上下轨全宽 ÷ 中线）。列名沿用计划中的 `bandwidth_pct`，
+但存的是**比值**，×100 才是百分数。代码与本文档均注明，避免后续查询误读。
+
+### 3. 回填完成判据改用 KV memo，比"`daily_bars` 无记录"更稳
+
+§3 建议用"`daily_bars` 中该 code 无记录"判断是否已回填。实测这一判据在**回填中途失败**时会误判：
+部分批次已写入 → 下次运行看到有记录 → 转为增量，历史永远补不齐。改为在**全部批次成功后**才写
+KV memo `snap:bf:{code}`，中途失败下次仍会重新完整回填（upsert 幂等，重跑无副作用）。
+KV 不可用时退回 §3 的 D1 计数判据。这仍然满足"不新增进度表"的约束（只多一个 `snap:` 前缀 key）。
+
+### 4. 预算截停：保底推进一只，避免死循环
+
+§3 的"按股票为单位截停"在写入上限被调得很小时会死锁——单只股票的行数就大于总预算，于是每轮都跳过、
+永远不推进。实现里加了一条：**本次运行还一行都没写时无条件写入当前这只**，保证任何预算下都单调推进。
+> ⚠️ 这条"本次运行还一行都没写时无条件写入"的放行条件后来被证明不成立（已回填股票的增量写入每轮
+> 都先执行，条件再也无法满足），见下一章《复审版计划的二次验收》缺陷 2。
+另外，还有股票因预算被跳过时**不写** `snap:done` memo，让同窗口（16:00–16:02）的后续 cron 继续跑完。
+
+上限默认 `MAX_ROWS_PER_RUN = 80_000`，可用环境变量 `SNAPSHOT_MAX_ROWS` 覆盖（§8 的截停验证用，无需改代码）。
+
+**关于"个人规模首日即可完成全部回填"**：实测 19 只股票 × 3 个周期，2020 年以来 1736 个交易日
+≈ 13 万行 > 8 万行预算，首日需要 **2 轮**。因 16:00–16:02 窗口内 cron 会触发 3 次且未跑完不写 memo，
+首日仍在同一分钟窗口内自动跑完；手动 `POST /api/snapshot-run` 也可以连点几次直到 `note` 里不再出现
+`budgetSkipped=`。周期集合越大、股票越多，轮数越多。
+
+### 5. 模块内重复实现了若干小工具（有意为之）
+
+`normalizeSecurityCode` / `inferMarket` / `mapWithConcurrency` / `fetchJsonWithRetry` / 新浪·雅虎日线拉取
+等在 `snapshot-store.js` 里重新实现了一份。原因：§5 规定主 Worker 只能有 5 个挂钩点（不含新增 export），
+且新模块 import 主 Worker 会形成循环依赖。重复换来的是"新模块 100% 不可能影响现有功能"——这是本次的最高原则。
+数据源选择、复权口径、布林带口径（**总体标准差，除以 N**，与 `computeLatestBands` 一致）均照抄主 Worker。
+
+新浪接口的 `datalen` 回填时取 1800（约 7 年，覆盖 2020 年以来）；增量时只取
+`最长周期 + 5 + 60` 根，省带宽。雅虎按自然日区间取，增量时按交易日数 ×1.6 折算。
+
+## 测试与验证
+
+无法在本地跑真实 Cloudflare，因此搭了三套替身做端到端验证：**D1 用 `node:sqlite` 真实执行 SQL**
+（真建表、真 upsert、真查询，不是 mock），KV 用 Map，行情源用确定性随机游走的合成日线
+（新浪 / 雅虎 / 腾讯 / 东财四种响应格式都按真实结构伪造）。
+
+### A. 模块层 `snapshot-store.js`（18 项，全部通过）
+
+| 用例 | 结果 |
+|------|------|
+| 无 `env.DB` 时三个导出全 no-op | 零 fetch、零 KV 写入，`/api/snapshot-history` → 503 |
+| 首跑回填 | `daily_bars` 覆盖 2020-01-01 以来全部 **1736** 个交易日；OHLCV 与数据源逐字段一致 |
+| 指标序列 | period 20/30/60 各自长度 = 交易日数 − N + 1，滚动窗口无缺口 |
+| 指标口径 | 中线/标准差/`sigma_offset`/`bandwidth_pct` 与 `computeLatestBands` 差 < 1e-9（总体标准差 ÷N） |
+| 多市场 | A股走新浪、港股(00700)/美股(AAPL) 走雅虎，三类均入库 |
+| 批大小 | 实测最大 50，未超 §2 上限 |
+| universe | 订阅 stocks ∪ watchlist codes ∪ 默认自选 → 19 只，归一化去重正确 |
+| 周期集合 | `note` 记录 `periods=20/30/60`（= {20} ∪ 订阅 period） |
+| **幂等** | 重跑写入 **380 行** = 19 只 × 5 日 × (1 根日线 + 3 个周期)，为理论上限；`daily_bars`/`daily_indicators` 总行数**完全不变** |
+| KV 防重 | 同日再次 cron → 命中 `snap:done:{日期}`，直接返回 `{skipped:"already done"}` |
+| KV 侵入面 | 只新增 `snap:` 前缀 key，`sub:`/`alert:`/`watchlist:` 结构未动 |
+| **容错** | mock `600183` 拉取 500 → `stocks_failed=1`、`stocks_ok=18`，其余照常入库，仅 warn |
+| 板块合成 | 等权平均值逐点核对；成分股 closes 短于横轴时右对齐正确；`member_count` 逐日统计 `[2,2,3,3]` |
+| 板块幂等 | 二次落库行数不膨胀 |
+| 查询 API | 升序返回、`Cache-Control: public, max-age=600`、字段集合正确 |
+| 参数校验 | `days` 默认 120 / 上限 500（999 → 400）、`period` 默认 20（1 → 400）、`code` 空 → 400 |
+| **预算截停** | `SNAPSHOT_MAX_ROWS=1000` 时按股票截停，三轮累计推进 4 只，未提前写 done memo；单只超总预算也不死锁 |
+| `snapshot_runs` | 按北京日期一行，起止时间/成功失败数/写入行数/note 齐备 |
+
+### B. 主 Worker 层（8 项，全部通过）
+
+| 用例 | 结果 |
+|------|------|
+| 无 D1：`/api/health`、404 兜底 | 与改动前一致 |
+| 无 D1：`/api/snapshot-history` | 503，其余路由不受影响 |
+| `/api/snapshot-run` 鉴权 | 无 Authorization → 401；错 token → 401；对 token → 200 `{run:null}`（无 D1） |
+| 无 `ALERT_SECRET` 的 env | 不 500 |
+| **无 D1 的完整 cron**（钉在周三北京时间 16:00） | 板块 KV 缓存、`sector:list:v1` 照常写入，行为与改动前一致 |
+| 有 D1 的 cron（挂钩点 2/3） | 17 只默认自选个股快照 + `sector_daily` 板块序列同时落库；末日指数 = 两只成分股收盘等权平均（差 < 1e-9），`member_count=2`，`name="PCB"` |
+| 挂钩点 4 | `/api/snapshot-history?code=600036&period=20&days=30` 返回 30 行 |
+| 挂钩点 5 | `POST /api/snapshot-run` 跳过 memo 强制重跑，返回 `snapshot_runs` 行（增量 170 行 = 17×5×2） |
+| **门控** | 钉在北京时间 10:00 跑 cron → D1 语句数 **0**，与板块刷新同门，窗口外不写任何东西 |
+
+### C. 部署脚本干跑（6 项，全部通过）
+
+| 场景 | 结果 |
+|------|------|
+| multipart 分片 | `["metadata", "subscription-worker.js", "ai-interpreter.js", "snapshot-store.js"]`，`main_module` 仍是 `subscription-worker.js` |
+| D1 不存在 | `GET /d1/database` → 空 → `POST /d1/database` 创建，binding = `{type:"d1", name:"DB", id:"<uuid>"}` |
+| D1 已存在 | 复用 uuid，**不再** POST 创建（幂等） |
+| bindings 全集 | `kv_namespace:SUBSCRIPTIONS`、`d1:DB`、`inherit:RESEND_API_KEY`、`inherit:ALERT_SECRET` —— 既有 secret inherit 逻辑未受影响 |
+| 输出 JSON | 含 `d1Database: "boll_snapshots"` |
+| `DISABLE_D1=1` | 不请求 `/d1/database`、bindings 无 d1 项、模块仍上传（Worker 侧全 no-op），输出 `d1Database: "disabled (DISABLE_D1=1)"` |
+
+### D. 语法检查
+
+`node --check` 对 `subscription-worker.js` / `snapshot-store.js` / `deploy-subscription-worker.js` 均通过。
+
+## 已知取舍 / 待观察
+
+- **回填历史深度受数据源限制**。新浪 `getKLineData` 单次最多返回约 1800 根日线（约 7 年），
+  对 2020-01-01 起点当前刚好够；若干年后需要改用支持分页的数据源，否则最早的历史会滚出窗口
+  （已入库的行不会丢，只是不再被 upsert 覆盖）。雅虎按区间取，无此问题。
+- **D1 subrequest 预算**。回填一只股票会产生上百个 `batch()` 调用，Workers 的单次请求 subrequest 上限
+  （免费档 50 / 付费档 1000）可能在大规模回填时触顶。触顶表现为该股票抛错 → 计入 `stocks_failed` →
+  因未写 `snap:bf:` memo，下次运行重新完整回填。不会产生半截数据，但可能需要多跑几轮。
+  个人规模（≤ 40 只、周期集合 ≤ 3）实测无碍。
+- **`amount`（成交额）恒为 NULL**。新浪 / 雅虎两个接口都不返回成交额，列先留着，
+  将来换数据源或补腾讯接口时可以直接回填。
+- **`snapshot_runs` 一天只留最后一次运行**。`run_date` 是主键、冲突时整行覆盖（不累加），
+  这样"紧接着重跑一次看 `rows_written` 是不是只有增量"的排查方式最直观；代价是同日多轮续跑时
+  只能看到最后一轮的数字，跨轮总量需要自己数 `daily_bars`。
+- **未做前端**。历史曲线展示、带宽收窄筛选等留给后续步骤；`/api/snapshot-history` 已经就绪可直接消费。
+
+## 上线后修补
+
+**全新 D1 首跑前查询返回 500**（上线当天发现并修复）。建表只发生在 `runDailySnapshot` /
+`persistSectorSnapshot` 里，而 `handleSnapshotHistory` 直接查 `daily_indicators`：新库在第一次
+快照跑完之前没有这张表，SQLite 的 `no such table` 被兜底成 500「查询失败」。语义上，查一个还没
+入库的代码就是「没有数据」，应当返回 200 + 空数组。已在查询处单独捕获该错误并返回空结果；
+其他故障（网络、D1 不可用等）仍照旧冒泡成 500，不被误吞。
+
+回归用例 6 项：表不存在 → 200 空数组且保留缓存头；400/503 分支不变；建表入库后照常返回真实序列；
+有表但该代码无数据 → 同样 200 空数组（两种「没数据」语义一致）；非表缺失的故障仍为 500。
+
+**雅虎当日 bar 返回 `close=0`**（首次回填后对账发现）。首跑落库 24,922 根日线后逐只核对，发现 5 条
+`close=0` 而 O/H/L/成交量正常的记录，全是港股（00700/00941/01810/03690/09988）、全在同一天 ——
+雅虎对尚未定盘的当日 bar 会给出 0 收盘价。原过滤只挡 `null`（`numberOrNull(0)` 是有限数，直接放行），
+于是 0 被写进 `daily_bars`，并毁掉包含它的整个指标窗口：那 5 行指标带宽 91.9%~94.0%、σ 偏离 −4.3。
+
+修复：新增 `positivePriceOrNull()`，收盘价必须是**有限正数**，0 / 负数 / NaN 一律视为「这根 bar 没有
+收盘价」而整根丢弃；新浪路径同样加固。
+
+**同一个洞也存在于 `subscription-worker.js` 的 `fetchYahooKlines`**（`Number.isFinite(rawClose)` 同样
+放行 0），属于本模块之前就有的既有缺陷，但影响更大：0 收盘价会让 `computeLatestBands` 算出假的
+「跌破下轨」触发**误报预警邮件**，前端 K 线也会掉到 0，且等比前复权时 `adj / rawClose` 会得到 Infinity。
+一并按同样口径加固。
+
+线上已清理：5 条脏 bar + 5 行被污染的指标（`DELETE ... WHERE close<=0` 及其对应指标行），
+港股序列回到最后一个有效交易日。回归用例 7 项：脏 bar 被丢弃且不误杀正常数据；指标带宽/σ 偏离
+回到正常量级；`/api/klines` 不再返回 0 收盘价；σ 偏离由 −4.29 回到 1.648（不再误报）。
+
+---
+
+# 验收记录二：复审版计划的二次验收（#7）
+
+> 计划正文在 #4 合入之后又被复审修正过（PR #1 的 commit `8fd64fa`：预算截停与防重 memo 的
+> 一致性、`force` 签名、KV `list()` 分页）。本章按**修正后**的计划重跑 §8，上面那一章记录的是
+> 初版实现按修正前计划的验收结果，两处结论冲突时以本章为准。
 ## 实现落点
 
 | 文件 | 状态 |
@@ -187,8 +366,13 @@ export async function handleSnapshotHistory(request, env)   // GET /api/snapshot
 | 7 | 预算 | 上限调到 1000（单只回填 6841 行 > 单轮预算）：全程**没有出现过半只股票的历史**（每个已入库代码的日线行数恒为 1737）；未跑完时不写 done memo，第 21 次跑完 20 只后才写；写完后再跑命中 memo 直接返回；`force:true` 跳过防重 |
 | 8 | 部署 dry-run | formData 含 `subscription-worker.js`/`ai-interpreter.js`/`snapshot-store.js` 三个 `application/javascript+module`；bindings 含 `{type:"d1",name:"DB",id:...}`；D1 已存在时复用 uuid 不重复创建；`DISABLE_D1=1` 时完全不碰 `/d1/` 接口、不加 binding，三个模块照常上传 |
 
-额外补跑的一项（不在 §8，但属于失败安全约束）：**D1 被重建后仍能补回历史**——换一个空库、沿用
-原 KV（回填 memo 还在），下一跑重新走全量回填而不是退化成每天 5 行。
+额外补跑的两项（不在 §8，但属于失败安全约束）：
+
+- **D1 被重建后仍能补回历史**——换一个空库、沿用原 KV（回填 memo 还在），下一跑重新走全量回填
+  而不是退化成每天 5 行。
+- **#6 的 `close=0` 修复在本分支上仍然成立**（合入基线分支后补跑，9/9 通过）——给港股与 A 股
+  两条数据源路径各注入一根 `close=0` 的当日 bar：整根被丢弃、`daily_bars` 无非正收盘价、序列停在
+  最后一个有效交易日、其余 1736 根照常入库、未受影响的代码不被误杀、指标窗口未被污染。
 
 ## 验收中发现并修掉的两个缺陷
 
@@ -261,3 +445,6 @@ universe 涨到几十只以上时暴露——也正是 §8 第 7 项要求验证
 - 挂钩点 3 的板块链路验证中，东财成分股排名与腾讯日线是 mock 的（板块清单接口故意返回 500，
   用来确认它挂掉时不影响落库）。
 - 验收脚本按 §1 交付物清单没有入库；如需复跑，本节"验收方法"已写清仿真环境的构成。
+
+> 本章全部数字都是在合入基线分支 #6（雅虎 `close=0` 修复）之后重跑的：`node --check` × 3、
+> 模块级 57/57、Worker 挂钩点级 15/15、`close=0` 回归 9/9、部署 dry-run 3 个场景，全部通过。

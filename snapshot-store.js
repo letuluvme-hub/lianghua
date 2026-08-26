@@ -128,6 +128,12 @@ function shiftCompactDate(compact, deltaDays) {
   return new Date(Date.UTC(year, month, day + deltaDays)).toISOString().slice(0, 10).replaceAll("-", "");
 }
 
+// 价格必须为有限正数。0 / 负数 / NaN 一律当作「这根 bar 没有收盘价」。
+function positivePriceOrNull(value) {
+  const numeric = Number(value);
+  return Number.isFinite(numeric) && numeric > 0 ? numeric : null;
+}
+
 function numberOrNull(value) {
   const numeric = Number(value);
   return Number.isFinite(numeric) ? numeric : null;
@@ -173,11 +179,11 @@ async function fetchSinaBars(code, datalen) {
       open: numberOrNull(row.open),
       high: numberOrNull(row.high),
       low: numberOrNull(row.low),
-      close: numberOrNull(row.close),
+      close: positivePriceOrNull(row.close),
       volume: numberOrNull(row.volume),
       amount: null, // 新浪该接口不返回成交额
     }))
-    .filter((bar) => /^\d{4}-\d{2}-\d{2}$/.test(bar.date) && Number.isFinite(bar.close));
+    .filter((bar) => /^\d{4}-\d{2}-\d{2}$/.test(bar.date) && bar.close !== null);
 }
 
 async function fetchYahooBars(code, market, beg, end) {
@@ -202,7 +208,9 @@ async function fetchYahooBars(code, market, beg, end) {
   const gmtoffset = result?.meta?.gmtoffset ?? 0;
   const bars = timestamps
     .map((timestamp, index) => {
-      const close = numberOrNull(quote.close?.[index]);
+      // 收盘价必须是正数：雅虎对当日尚未定盘的 bar（尤其港股）会返回 close=0 而
+      // O/H/L/成交量正常，若放行会污染 daily_bars 并毁掉包含它的整个指标窗口。
+      const close = positivePriceOrNull(quote.close?.[index]);
       if (close === null) return null;
       return {
         date: yahooDate(timestamp, gmtoffset),
