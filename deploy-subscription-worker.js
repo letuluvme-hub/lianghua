@@ -7,6 +7,8 @@ const resendFromEmail = process.env.RESEND_FROM_EMAIL || "日布林带 <noreply@
 const scriptName = process.env.CLOUDFLARE_WORKER_SCRIPT || "boll-alert-subscriptions";
 const kvTitle = process.env.CLOUDFLARE_KV_TITLE || "boll_alert_subscriptions";
 const workerFile = "subscription-worker.js";
+// 主模块之外还需要一并上传的 ES module（Worker 侧以相对路径 import）。
+const extraModuleFiles = ["ai-interpreter.js"];
 
 async function api(pathname, options = {}) {
   const response = await fetch(`https://api.cloudflare.com/client/v4${pathname}`, {
@@ -34,28 +36,52 @@ async function ensureKvNamespace() {
   });
 }
 
+// 已存在的 binding 名单：用于判断 inherit 是否安全（脚本尚未创建时 inherit 会失败）。
+// 404（脚本还不存在）→ 空集合；其他错误 → null 表示“未知”，调用方沿用旧行为。
+async function fetchExistingBindingNames() {
+  try {
+    const response = await fetch(
+      `https://api.cloudflare.com/client/v4/accounts/${accountId}/workers/scripts/${scriptName}/settings`,
+      { headers: { Authorization: `Bearer ${apiToken}` } }
+    );
+    if (response.status === 404) return new Set();
+    const json = await response.json().catch(() => null);
+    if (!response.ok || !json?.success) return null;
+    return new Set((json.result?.bindings || []).map((binding) => binding.name));
+  } catch {
+    return null;
+  }
+}
+
 async function uploadWorker(namespaceId) {
   const source = await fs.readFile(workerFile, "utf8");
+  const extraModules = await Promise.all(
+    extraModuleFiles.map(async (file) => ({ file, source: await fs.readFile(file, "utf8") }))
+  );
+  const existingBindingNames = await fetchExistingBindingNames();
   const bindings = [
     { type: "kv_namespace", name: "SUBSCRIPTIONS", namespace_id: namespaceId },
   ];
   // 仅在显式提供了新值时才覆盖 secret_text，否则用 inherit 继承上次部署的值，
   // 避免不小心清空 RESEND_API_KEY 或滚动 ALERT_SECRET 破坏 cron 鉴权。
-  bindings.push(
-    resendApiKey
-      ? { type: "secret_text", name: "RESEND_API_KEY", text: resendApiKey }
-      : { type: "inherit", name: "RESEND_API_KEY" }
-  );
-  bindings.push(
-    process.env.RESEND_FROM_EMAIL
-      ? { type: "secret_text", name: "RESEND_FROM_EMAIL", text: resendFromEmail }
-      : { type: "inherit", name: "RESEND_FROM_EMAIL" }
-  );
-  bindings.push(
-    process.env.ALERT_SECRET
-      ? { type: "secret_text", name: "ALERT_SECRET", text: process.env.ALERT_SECRET }
-      : { type: "inherit", name: "ALERT_SECRET" }
-  );
+  // 上次部署没有这个 binding 时（比如首次部署、或从未配过 AI Key）直接省略，
+  // 因为 inherit 一个不存在的 binding 会让整次上传失败。
+  const pushSecret = (name, value, { legacy = false } = {}) => {
+    if (value) {
+      bindings.push({ type: "secret_text", name, text: value });
+      return;
+    }
+    const unknown = existingBindingNames === null;
+    if (existingBindingNames?.has(name) || (unknown && legacy)) {
+      bindings.push({ type: "inherit", name });
+    }
+  };
+  pushSecret("RESEND_API_KEY", resendApiKey, { legacy: true });
+  pushSecret("RESEND_FROM_EMAIL", process.env.RESEND_FROM_EMAIL ? resendFromEmail : "", { legacy: true });
+  pushSecret("ALERT_SECRET", process.env.ALERT_SECRET, { legacy: true });
+  // AI 解读模块所需（可选）：未配置时 Worker 侧自动关闭该功能，预警邮件按原样发送。
+  pushSecret("ANTHROPIC_API_KEY", process.env.ANTHROPIC_API_KEY);
+  pushSecret("ANTHROPIC_MODEL", process.env.ANTHROPIC_MODEL);
   const metadata = {
     main_module: workerFile,
     compatibility_date: "2026-05-23",
@@ -65,6 +91,13 @@ async function uploadWorker(namespaceId) {
   const formData = new FormData();
   formData.append("metadata", new Blob([JSON.stringify(metadata)], { type: "application/json" }));
   formData.append(workerFile, new Blob([source], { type: "application/javascript+module" }), workerFile);
+  for (const module of extraModules) {
+    formData.append(
+      module.file,
+      new Blob([module.source], { type: "application/javascript+module" }),
+      module.file
+    );
+  }
 
   return api(`/accounts/${accountId}/workers/scripts/${scriptName}`, {
     method: "PUT",
@@ -105,6 +138,7 @@ async function main() {
         kvNamespace: namespace.title,
         workerUrl,
         resendFromEmail,
+        aiInterpreter: process.env.ANTHROPIC_API_KEY ? "enabled (key updated)" : "unchanged (see ANTHROPIC_API_KEY)",
         schedule: "* * * * *",
       },
       null,
