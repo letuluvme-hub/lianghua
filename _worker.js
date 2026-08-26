@@ -11,7 +11,9 @@ export default {
 
     // PCB 专版已并入自选板块看板（PCB 为默认自选之一），旧链接永久重定向。
     if (url.pathname === "/pcb.html") {
-      return Response.redirect(`${url.origin}/sectors.html`, 301);
+      // 用相对 Location：浏览器按它实际请求的地址解析，
+      // 站点被挂到 /boll 这类子路径下时也不会被甩回 pages.dev。
+      return new Response(null, { status: 301, headers: { location: "./sectors.html" } });
     }
 
     if (url.pathname.startsWith("/api/")) {
