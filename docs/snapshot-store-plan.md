@@ -74,24 +74,24 @@ CREATE TABLE IF NOT EXISTS snapshot_runs (
 
 ## 3. 快照范围（universe）与回填策略
 
-- **股票集合** = 所有 `sub:`/`alert:` 订阅的 `stocks` ∪ 所有 `watchlist:` 键的 `codes` ∪ `DEFAULT_WATCHLIST_CODES`，`normalizeSecurityCode` 后去重；上限 200 只（超出截断并 `console.warn` 被丢弃的部分）。
+- **股票集合** = 所有 `sub:`/`alert:` 订阅的 `stocks` ∪ 所有 `watchlist:` 键的 `codes` ∪ `DEFAULT_WATCHLIST_CODES`，`normalizeSecurityCode` 后去重；上限 200 只（超出截断并 `console.warn` 被丢弃的部分）。注意 KV `list()` 是分页的（单次最多 1000 keys）：要循环携带 `cursor` 直到 `list_complete` 为 true，不能只取第一页。
 - **周期集合** = `{20}` ∪ 各订阅的 `period` 去重。
 - **板块集合** = `getTrackedSectors(env)`。
 - **增量 vs 回填**：
   - 某股票在 `daily_bars` 已有记录 → 只 upsert **最近 5 个交易日**（容忍数据源事后修正）。
   - 首次入库 → **回填**：利用本来就拉到的 2020 年以来全量序列，滚动计算各 period 的指标序列一并入库。
-- **写入预算（D1 免费档每日写入行数有限）**：模块内置单次运行写入上限（默认 80,000 行，常量可调）。超预算时按股票为单位截停，未完成的股票下次 cron 自动续跑（判据：`daily_bars` 中该 code 无记录即未回填完成，无需额外进度表）。个人规模（几十只股票）首日即可完成全部回填。
+- **写入预算（D1 免费档每日写入行数有限）**：模块内置单次运行写入上限（默认 80,000 行，常量可调）。超预算时**在股票边界截停**：开写某只股票的回填前先估算其行数（序列长度 × 周期数），剩余预算不够就整只跳过留给下次——绝不写入半只股票的历史，这样"`daily_bars` 中该 code 无记录即未回填完成"这一续跑判据才成立，无需额外进度表。个人规模（几十只股票）首日即可完成全部回填。
 
 ## 4. 新模块 `snapshot-store.js` 接口
 
 ```js
 // 三个导出全部遵守：【永不 throw】；env.DB 未绑定 → 立即 return（功能整体关闭）。
-export async function runDailySnapshot(env)
+export async function runDailySnapshot(env, opts = {})      // opts.force = true 跳过 KV memo 防重（手动触发用）
 export async function persistSectorSnapshot(env, payload)   // payload = refreshSectorBollinger 的返回值
 export async function handleSnapshotHistory(request, env)   // GET /api/snapshot-history 的处理器
 ```
 
-`runDailySnapshot` 流程：建表 → 防重检查（KV memo `snap:done:{北京日期}`，命中即返回；16:00–16:02 容错窗内 cron 会进来 3 次，靠它只跑一次，upsert 本身幂等只是兜底）→ 汇总 universe → `mapWithConcurrency(4)` 拉 K 线（数据源选择照抄 `fetchStockSnapshot`：A股 Sina / 美股 Yahoo）→ 按 §3 增量或回填 → 写 `snapshot_runs` → 写 KV memo。单只股票失败 warn 后继续（照抄 `sendDueAlerts` 的逐项兜底风格），不拖垮批次。
+`runDailySnapshot` 流程：建表 → 防重检查（KV memo `snap:done:{北京日期}`，命中且非 `opts.force` 即返回）→ 汇总 universe → `mapWithConcurrency(4)` 拉 K 线（数据源选择照抄 `fetchStockSnapshot`：A股 Sina / 美股 Yahoo）→ 按 §3 增量或回填 → 写 `snapshot_runs`。**done memo 只在完整完成（本次未因预算截停任何股票）时写入**：截停时不写，16:00–16:02 容错窗内 cron 还会进来 1–2 次，可继续回填下一批；仍未完成的留到次日 16:00 续跑（upsert 幂等，重复进入无害）。单只股票失败 warn 后继续（照抄 `sendDueAlerts` 的逐项兜底风格），不拖垮批次。
 
 `persistSectorSnapshot`：从 payload 的 `dates` × `stocks[].closes` 计算每日合成指数（**方法与 sectors.html 前端一致，实现前必须先读前端确认**），首次全量、之后只 upsert 最近 5 日。
 
@@ -103,7 +103,7 @@ export async function handleSnapshotHistory(request, env)   // GET /api/snapshot
 2. `scheduled()` 中 `shouldRefreshPcbNow()` 门内追加：`tasks.push(runDailySnapshot(env));`（与既有任务并列，各自 catch，互不影响）。
 3. `scheduled()` 板块刷新回调里，`refreshSectorBollinger(env, bk)` 成功后追加 `.then((payload) => persistSectorSnapshot(env, payload))`（不改 `refreshSectorBollinger` 函数本身）。
 4. `fetch` 路由表新增：`/api/snapshot-history`（GET，公开只读）→ `handleSnapshotHistory`。
-5. `fetch` 路由表新增：`/api/snapshot-run`（POST，`Bearer ALERT_SECRET` 鉴权，照抄 `/api/send-alerts` 写法）→ 手动触发 `runDailySnapshot`（跳过 KV memo 防重，传 `force` 参数），返回 `snapshot_runs` 最新一行。用于上线首跑与排查。
+5. `fetch` 路由表新增：`/api/snapshot-run`（POST，`Bearer ALERT_SECRET` 鉴权，照抄 `/api/send-alerts` 写法）→ 手动触发 `runDailySnapshot(env, { force: true })`，返回 `snapshot_runs` 最新一行。用于上线首跑与排查。
 
 ## 6. `deploy-subscription-worker.js` 改动
 
