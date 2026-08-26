@@ -1,4 +1,5 @@
 import { generateAlertInterpretation } from "./ai-interpreter.js";
+import { runDailySnapshot, persistSectorSnapshot, handleSnapshotHistory } from "./snapshot-store.js";
 
 const WATCHLIST = {
   "688256": { name: "寒武纪" },
@@ -1249,6 +1250,16 @@ export default {
         }
         return json({ sent: await sendDueAlerts(env, true) });
       }
+      if (url.pathname === "/api/snapshot-history" && request.method === "GET") {
+        return await handleSnapshotHistory(request, env);
+      }
+      if (url.pathname === "/api/snapshot-run" && request.method === "POST") {
+        if (!env.ALERT_SECRET || request.headers.get("Authorization") !== `Bearer ${env.ALERT_SECRET}`) {
+          return json({ error: "Unauthorized" }, 401);
+        }
+        // force=true 跳过 KV 防重 memo，用于上线首跑与排查。
+        return json({ run: await runDailySnapshot(env, { force: true }) });
+      }
       if (url.pathname === "/api/pcb-bollinger" && request.method === "GET") {
         return await handlePcbBollinger(request, env);
       }
@@ -1266,15 +1277,18 @@ export default {
   async scheduled(event, env, ctx) {
     const tasks = [sendDueSubscriptions(env), sendDueAlerts(env)];
     if (shouldRefreshPcbNow()) {
+      // 每日指标快照落库（独立任务，与板块刷新并列；未绑定 D1 时内部立即返回）
+      tasks.push(runDailySnapshot(env).catch((err) => console.error("[snapshot]", err?.message || err)));
       // 先刷板块清单（供 getBoardName 命名），再刷“被访问过的板块集合”（始终含 PCB）
       tasks.push(
         (async () => {
           await refreshSectorList(env).catch((err) => console.error("[sector list refresh]", err?.message || err));
           const bks = await getTrackedSectors(env);
           await mapWithConcurrency(bks, 2, (bk) =>
-            refreshSectorBollinger(env, bk).catch((err) =>
-              console.error(`[sector refresh ${bk}]`, err?.message || err)
-            )
+            refreshSectorBollinger(env, bk)
+              // 刷新成功后顺带落库板块合成指数；失败不影响 KV 缓存已经写好的结果。
+              .then((payload) => persistSectorSnapshot(env, payload))
+              .catch((err) => console.error(`[sector refresh ${bk}]`, err?.message || err))
           );
         })().catch((err) => console.error("[sector refresh]", err?.message || err))
       );
