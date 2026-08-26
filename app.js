@@ -2,7 +2,10 @@
   const { useEffect, useMemo, useRef, useState } = React;
 
   const BAND_MULTIPLIERS = [1, 2, 3];
-  const API_BASE = window.BOLL_ALERT_API_URL || "https://cambricon-boll-midline.pages.dev";
+  // 同源优先：页面挂在根域、子域名或 /boll 这类子路径下都能工作，
+  // 请求跟着当前地址走，不会再跨域回 pages.dev（国内不可达）。
+  // 需要指向别的后端时（本地开发等）仍可用 window.BOLL_ALERT_API_URL 显式覆盖。
+  const API_BASE = window.BOLL_ALERT_API_URL ?? new URL("./", location.href).pathname.replace(/\/$/, "");
   const AUTH_STORAGE_KEY = "bollAuthSession";
   const CUSTOM_GROUPS_STORAGE_KEY = "bollCustomGroups";
   const CUSTOM_GROUPS_SEED_KEY = "bollCustomGroupsSeed";

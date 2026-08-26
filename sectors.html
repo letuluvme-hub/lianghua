@@ -350,8 +350,10 @@ tbody tr.active td:first-child { box-shadow: inset 3px 0 0 var(--brand); }
 <div id="toast" class="toast"></div>
 
 <script>
-const API_BASE = "/api/sector-bollinger";
-const LIST_API = "/api/sector-list";
+// 跟随当前地址的路径前缀，挂在 /boll 这类子路径下也能正确请求。
+const ROUTE_BASE = new URL("./", location.href).pathname.replace(/\/$/, "");
+const API_BASE = `${ROUTE_BASE}/api/sector-bollinger`;
+const LIST_API = `${ROUTE_BASE}/api/sector-list`;
 const PICKS_KEY = "bollSectorPicks";
 const SEED_MAT_KEY = "bollSectorSeededMat";
 const SETTINGS_KEY = "bollSectorSettings";

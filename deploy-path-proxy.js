@@ -1,0 +1,130 @@
+// 部署站点代理 Worker（path-proxy-worker.js）。
+//
+// 用途：把 Pages 站点挂到国内可达的自有域名上（*.pages.dev 在国内不可达）。
+//
+// 线上形态：Worker `boll-path-proxy` 绑 Custom Domain `boll.fangtuo.top`，
+// 整站挂载（默认）。Custom Domain 在 Cloudflare 面板上绑定，本脚本不涉及。
+//
+// 也支持子路径挂载：PROXY_PREFIX=/boll PROXY_ZONE=solmate.top 时会去绑
+// route；该步骤需要 zone 级 Workers Routes 权限，令牌没有时脚本不失败，
+// 改为打印需手动添加的路由。
+//
+// 环境变量：
+//   CLOUDFLARE_ACCOUNT_ID / CLOUDFLARE_API_TOKEN  必填
+//   PROXY_PREFIX    默认空（整站挂载）  —— 设为 /boll 之类则改为子路径挂载
+//   PROXY_ZONE      默认 solmate.top   —— 子路径挂载时绑 route 用，整站模式忽略
+//   PAGES_ORIGIN    默认 Pages 站点地址   —— 回源地址
+//   PROXY_SCRIPT    默认 boll-path-proxy  —— Worker 脚本名
+
+const fs = require("node:fs/promises");
+
+const accountId = process.env.CLOUDFLARE_ACCOUNT_ID;
+const apiToken = process.env.CLOUDFLARE_API_TOKEN;
+const zoneName = process.env.PROXY_ZONE || "solmate.top";
+// 留空（PROXY_PREFIX= 或 PROXY_PREFIX=/）表示整个主机名挂载：
+// 这种模式下用 Worker 的 Custom Domain 绑定，不需要 route。
+const rawPrefix = String(process.env.PROXY_PREFIX ?? "").replace(/^\/+|\/+$/g, "");
+const prefix = rawPrefix ? `/${rawPrefix}` : "";
+const pagesOrigin = process.env.PAGES_ORIGIN || "https://cambricon-boll-midline.pages.dev";
+const scriptName = process.env.PROXY_SCRIPT || "boll-path-proxy";
+const workerFile = "path-proxy-worker.js";
+
+async function api(pathname, options = {}) {
+  const response = await fetch(`https://api.cloudflare.com/client/v4${pathname}`, {
+    ...options,
+    headers: { Authorization: `Bearer ${apiToken}`, ...(options.headers || {}) },
+  });
+  const json = await response.json().catch(() => null);
+  if (!response.ok || !json?.success) {
+    const error = new Error(`${options.method || "GET"} ${pathname} failed: ${JSON.stringify(json)}`);
+    error.status = response.status;
+    throw error;
+  }
+  return json.result;
+}
+
+async function uploadWorker() {
+  const source = await fs.readFile(workerFile, "utf8");
+  const metadata = {
+    main_module: workerFile,
+    compatibility_date: "2026-05-23",
+    bindings: [
+      { type: "plain_text", name: "PAGES_ORIGIN", text: pagesOrigin },
+      { type: "plain_text", name: "PREFIX", text: prefix },
+    ],
+  };
+  const formData = new FormData();
+  formData.append("metadata", new Blob([JSON.stringify(metadata)], { type: "application/json" }));
+  formData.append(workerFile, new Blob([source], { type: "application/javascript+module" }), workerFile);
+  return api(`/accounts/${accountId}/workers/scripts/${scriptName}`, { method: "PUT", body: formData });
+}
+
+// 两条精确路由，而不是一条 `/boll*`：后者会连 /bollocks 这类同前缀路径一起吃掉，
+// 那些路径本该继续由域名原来的源站处理。
+function routePatterns() {
+  return [`${zoneName}${prefix}`, `${zoneName}${prefix}/*`];
+}
+
+async function ensureRoutes() {
+  const zones = await api(`/zones?name=${encodeURIComponent(zoneName)}`);
+  const zoneId = zones?.[0]?.id;
+  if (!zoneId) throw new Error(`zone ${zoneName} not found`);
+  const existing = await api(`/zones/${zoneId}/workers/routes`);
+  const have = new Set((existing || []).filter((r) => r.script === scriptName).map((r) => r.pattern));
+  const added = [];
+  for (const pattern of routePatterns()) {
+    if (have.has(pattern)) continue;
+    await api(`/zones/${zoneId}/workers/routes`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ pattern, script: scriptName }),
+    });
+    added.push(pattern);
+  }
+  return { zoneId, added, alreadyPresent: [...have] };
+}
+
+async function main() {
+  if (!accountId || !apiToken) {
+    throw new Error("CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN are required.");
+  }
+  await uploadWorker();
+
+  // 整站挂载模式不需要 route：主机名由 Worker 的 Custom Domain 绑定。
+  let routes = null;
+  let routeError = null;
+  if (prefix) {
+    try {
+      routes = await ensureRoutes();
+    } catch (error) {
+      routeError = error;
+    }
+  }
+
+  const result = {
+    scriptName,
+    mode: prefix ? "子路径挂载（route）" : "整个主机名挂载（Custom Domain）",
+    mountedAt: prefix ? `https://${zoneName}${prefix}` : "由 Worker 的 Custom Domain 决定",
+    pagesOrigin,
+    workerUploaded: true,
+  };
+  if (!prefix) {
+    result.routes = "不适用（Custom Domain 模式）";
+  } else if (routes) {
+    result.routes = { added: routes.added, alreadyPresent: routes.alreadyPresent };
+  } else {
+    result.routes = "FAILED — 令牌缺少 zone 级 Workers Routes 权限";
+    result.manualStep = {
+      where: "Cloudflare 面板 → Workers & Pages → " + scriptName + " → Settings → Domains & Routes → Add route",
+      patterns: routePatterns(),
+      zone: zoneName,
+      reason: String(routeError?.message || routeError).slice(0, 200),
+    };
+  }
+  console.log(JSON.stringify(result, null, 2));
+}
+
+main().catch((error) => {
+  console.error(error.message);
+  process.exitCode = 1;
+});
