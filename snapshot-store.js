@@ -616,6 +616,12 @@ export async function persistSectorSnapshot(env, payload) {
 // 导出 3：历史查询 API
 // ---------------------------------------------------------------------------
 
+// 表还没建起来时 D1 抛的是 SQLite 的 "no such table: xxx"，与「查不到数据」等价。
+function isMissingTableError(err) {
+  const message = String(err?.cause?.message || err?.message || err);
+  return /no such table/i.test(message);
+}
+
 function jsonResponse(data, status = 200, extraHeaders = {}) {
   return new Response(JSON.stringify(data), {
     status,
@@ -651,16 +657,25 @@ export async function handleSnapshotHistory(request, env) {
     }
 
     // 先按日期倒序取最近 days 条，再翻回升序返回。
-    const result = await env.DB
-      .prepare(
-        `SELECT trade_date, close, middle, stddev, sigma_offset, bandwidth_pct
-           FROM daily_indicators
-          WHERE code = ? AND period = ?
-          ORDER BY trade_date DESC
-          LIMIT ?`
-      )
-      .bind(code, period, days)
-      .all();
+    // 全新 D1 在第一次快照跑完之前还没有建表（建表只发生在 runDailySnapshot /
+    // persistSectorSnapshot 里），此时查一个还没入库的代码语义上就是「没有数据」，
+    // 应当返回 200 + 空数组，而不是把 SQLite 的 "no such table" 冒泡成 500。
+    let result;
+    try {
+      result = await env.DB
+        .prepare(
+          `SELECT trade_date, close, middle, stddev, sigma_offset, bandwidth_pct
+             FROM daily_indicators
+            WHERE code = ? AND period = ?
+            ORDER BY trade_date DESC
+            LIMIT ?`
+        )
+        .bind(code, period, days)
+        .all();
+    } catch (err) {
+      if (!isMissingTableError(err)) throw err;
+      result = null;
+    }
     const rows = (result?.results || []).slice().reverse();
     return jsonResponse({ code, period, days, rows }, 200, {
       "Cache-Control": `public, max-age=${HISTORY_CACHE_SECONDS}`,
