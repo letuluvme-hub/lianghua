@@ -404,7 +404,9 @@ async function fetchYahooKlines({ code, marketMode = "auto", beg, end, proportio
   const klines = timestamps
     .map((timestamp, index) => {
       const rawClose = quote.close?.[index];
-      if (!Number.isFinite(rawClose)) return null;
+      // 收盘价必须是正数：雅虎对当日尚未定盘的 bar（尤其港股）会返回 close=0 而
+      // O/H/L 正常，放行会让布林带算出假的「跌破下轨」并触发误报邮件。
+      if (!Number.isFinite(rawClose) || rawClose <= 0) return null;
       const rawOpen = quote.open?.[index] ?? rawClose;
       const rawHigh = quote.high?.[index] ?? rawClose;
       const rawLow = quote.low?.[index] ?? rawClose;
