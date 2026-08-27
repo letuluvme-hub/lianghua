@@ -448,3 +448,61 @@ universe 涨到几十只以上时暴露——也正是 §8 第 7 项要求验证
 
 > 本章全部数字都是在合入基线分支 #6（雅虎 `close=0` 修复）之后重跑的：`node --check` × 3、
 > 模块级 57/57、Worker 挂钩点级 15/15、`close=0` 回归 9/9、部署 dry-run 3 个场景，全部通过。
+
+
+---
+
+# 上线后事故复盘：cron 连续 24 分钟全线失败
+
+## 现象
+
+首次接入 D1 后的第一个 cron 快照窗口（北京 2026-08-27 16:00），Workers 调用分析显示：
+
+```
+07:59:17Z  success             cpu=17ms
+08:00:21Z  exceededResources   cpu=627ms   ← 快照回填被运行时掐断
+08:01:17Z  exceededResources   cpu=10ms
+…每分钟一次，直到 08:24 重新部署为止，连续 22+ 次
+```
+
+`shouldRefreshPcbNow()` 在 08:03 之后就关闭了，快照/板块任务根本没被创建，失败的是
+`sendDueSubscriptions` / `sendDueAlerts` 这条基础路径 —— 也就是说**日报与预警邮件停发了 24 分钟**。
+同期 fetch 入口（`/api/health` 等）一直正常，故障只在 cron。
+
+## 根因链
+
+1. 16:00 那次 cron 要为 7 只新增订阅股票做首次回填，约 2.3 万行、约 450 个 batch。
+2. 单轮写入上限当时是 **80,000 行**，对「D1 每日额度」是合理的，但对「一次 Workers 调用
+   能提交多少」远远过宽，`reserve()` 一路放行，调用在写到约 1.87 万行、约 375 个 batch 时
+   被以 `exceededResources` 掐断（指标写到一半、`snapshot_runs` 没落盘）。
+3. 被掐断的调用留下了**没有超时的出站请求**：两处 `fetchJsonWithRetry`（本模块与主 Worker）
+   都是裸 `fetch(url, options)`，没有 `AbortSignal`。悬挂的 promise 把 isolate 钉死。
+4. 之后每一分钟的 cron 触发进到同一个被钉死的 isolate，10ms 就 `exceededResources`，
+   自身完全无辜。重新部署强制生成新 isolate 后立刻恢复（08:24:17 起全部 success）。
+
+## 修复
+
+| 改动 | 位置 | 作用 |
+|------|------|------|
+| 每次出站请求加 `AbortSignal.timeout(15s)` | `snapshot-store.js` + `subscription-worker.js` 的 `fetchJsonWithRetry` | 断掉第 3 步，挂死的数据源不再能钉死 isolate |
+| `MAX_ROWS_PER_RUN` 80,000 → **12,000** | `snapshot-store.js` | 断掉第 2 步。约 240 个 batch，只有致死量级的六成多 |
+
+上限取值的权衡：单只股票回填约 3.4k 行，1.2 万约放行 3 只/轮。再低会拖慢新增股票的首次回填
+（6,000 时只放行 1 只/轮，17 只要 17 轮、按每天 3 次 cron 要 6 天）；再高就逼近实测被掐断的位置。
+首次上线要一次灌满时用 `POST /api/snapshot-run`（force）连点几次，比等 cron 快得多。
+
+## 同期修复的数据损伤
+
+被掐断的那次留下 3 只股票「bars 完整、指标半截」（603986 断在 2022-09-14、688008 断在
+2021-09-01、688012 无 memo）。PR #7 已把 `isBackfilled` 改成「D1 有行 **且** memo 存在」，
+这类半截状态下次运行会自动重新完整回填 —— 已借 D1 REST 通道跑模块自身的 `runDailySnapshot`
+当场补齐，24 只全部 `bars − indicators = 19`（period=20 的正常滚动窗口）。
+
+## 仍未解决（既有问题，不在本模块范围）
+
+`sector_daily` 至今为 0 行。原因是**板块刷新本身早就不工作了**，与本模块无关：`sector:tracked`
+里 13 个板块的 `sector:bollinger:*` 缓存最新的是 2026-08-26（1 个），其余停在 7 月；而
+`sector:list:v1` 每天都能刷新成功。即在 `refreshSectorList()` 之后、逐板块
+`refreshSectorBollinger()` 阶段失败 —— 13 个板块 × (1 次成分 + 20 次 K 线) ≈ 273 次出站请求
+挤在同一次调用里。本次给主 Worker 的 `fetchJsonWithRetry` 加超时会改善「挂死」这一类，但
+「一次调用塞不下 273 次请求」需要把板块刷新拆散到多个 cron 分片，属于板块模块自身的改造。

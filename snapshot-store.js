@@ -9,7 +9,18 @@
 //    行为与未接入本模块时逐字节一致。这也是整体回滚路径（部署时 DISABLE_D1=1）。
 
 const MAX_UNIVERSE = 200; // 单次快照最多覆盖多少只股票（超出截断并 warn）
-const MAX_ROWS_PER_RUN = 80_000; // 单次运行写入行数上限（D1 免费档每日写入有限额）
+const FETCH_TIMEOUT_MS = 15_000; // 单次行情请求超时（毫秒）
+// 单次运行写入行数上限。这个数不是按「D1 每日额度」定的，而是按「一次 Workers 调用
+// 实际能提交多少」定的：实测 16:00 那次 cron 写到约 1.87 万行、约 375 个 batch 时被
+// 运行时以 exceededResources 掐断，指标写到一半、snapshot_runs 没落盘。原来的 8 万行
+// 根本挡不住，必须收到一次调用稳稳吃得下的量级（约 120 个 batch）。
+// 一轮吃不完的回填靠「不写 snap:done → 下次 cron 续跑」自然接力。
+//
+// 取值权衡：单只股票回填约 3.4k 行，这个上限约放行 3 只/轮（约 240 个 batch，
+// 只有致死量级的六成多）。再低会拖慢新增股票的首次回填（1 只/轮 × 每天 3 次
+// cron），再高就逼近实测被掐断的位置。首次上线要一次灌满时，用
+// POST /api/snapshot-run（force）连点几次，比等 cron 快得多。
+const MAX_ROWS_PER_RUN = 12_000;
 const BATCH_SIZE = 50; // 每个 env.DB.batch() 最多多少条语句
 const FETCH_CONCURRENCY = 4; // 与 sendDueAlerts 的 mapWithConcurrency(4) 保持一致
 const BACKFILL_START = "20200101"; // 回填起点（与 fetchStockSnapshot 的 beg 一致）
@@ -53,7 +64,10 @@ async function fetchJsonWithRetry(urls, options = {}, label = "request") {
   for (const url of candidates) {
     for (let attempt = 0; attempt < 2; attempt += 1) {
       try {
-        const response = await fetch(url, options);
+        // 必须带超时：没有超时的 fetch 可以在 cron 调用被运行时掐断后继续挂着，
+        // 把 isolate 钉死，之后每一次 cron 触发进到同一个 isolate 都会立刻
+        // exceededResources —— 实测造成过连续 24 分钟的 cron 全线失败。
+        const response = await fetch(url, { ...options, signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
         if (!response.ok) throw new Error(`${label} returned ${response.status}`);
         return await response.json();
       } catch (err) {
