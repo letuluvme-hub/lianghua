@@ -21,6 +21,7 @@ const WATCHLIST = {
   META: { name: "Meta" },
 };
 
+const FETCH_TIMEOUT_MS = 15_000; // 单次行情请求超时（毫秒）
 const MULTIPLIERS = [1, 2, 3];
 const DEFAULT_PERIOD = 20;
 const TIMEZONE = "Asia/Shanghai";
@@ -145,7 +146,10 @@ async function fetchJsonWithRetry(urls, options = {}, label = "request") {
   for (const url of candidates) {
     for (let attempt = 0; attempt < 2; attempt += 1) {
       try {
-        const response = await fetch(url, options);
+        // 必须带超时：没有超时的 fetch 可以在 cron 调用被运行时掐断后继续挂着，
+        // 把 isolate 钉死，之后每一次 cron 触发进到同一个 isolate 都会立刻
+        // exceededResources —— 实测造成过连续 24 分钟的 cron 全线失败。
+        const response = await fetch(url, { ...options, signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
         if (!response.ok) throw new Error(`${label} returned ${response.status}`);
         return await response.json();
       } catch (err) {
