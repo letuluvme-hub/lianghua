@@ -1,5 +1,6 @@
 import { generateAlertInterpretation } from "./ai-interpreter.js";
 import { runDailySnapshot, persistSectorSnapshot, handleSnapshotHistory } from "./snapshot-store.js";
+import { buildSignalContext, renderSignalContextHtml, handleSignalContext } from "./signal-context.js";
 
 const WATCHLIST = {
   "688256": { name: "寒武纪" },
@@ -932,7 +933,7 @@ function evaluateAlert(snapshot, subscription) {
   };
 }
 
-function renderAlertEmail(subscription, alerts, aiHtml = null) {
+function renderAlertEmail(subscription, alerts, aiHtml = null, signalHtml = null) {
   const rows = alerts
     .map(
       (item) => `
@@ -962,7 +963,7 @@ function renderAlertEmail(subscription, alerts, aiHtml = null) {
           </tr>
         </thead>
         <tbody>${rows}</tbody>
-      </table>${aiHtml || ""}
+      </table>${signalHtml || ""}${aiHtml || ""}
       <p style="color:#64748b;font-size:12px;">同一邮箱、同一股票、同一规则在同一交易日只发送一次预警。</p>
     </div>
   `;
@@ -1002,8 +1003,8 @@ function renderAlertConfirmationEmail(subscription, snapshots) {
   `;
 }
 
-async function sendAlertEmail(env, subscription, alerts, subjectPrefix = "日布林带预警", aiHtml = null) {
-  return sendResendEmail(env, subscription.email, `${subjectPrefix} ${currentShanghaiParts().date}`, renderAlertEmail(subscription, alerts, aiHtml));
+async function sendAlertEmail(env, subscription, alerts, subjectPrefix = "日布林带预警", aiHtml = null, signalHtml = null) {
+  return sendResendEmail(env, subscription.email, `${subjectPrefix} ${currentShanghaiParts().date}`, renderAlertEmail(subscription, alerts, aiHtml, signalHtml));
 }
 
 async function handleSubscribe(request, env) {
@@ -1210,9 +1211,11 @@ async function sendDueAlerts(env, force = false) {
         continue;
       }
 
-      // 内部永不 throw：AI 不可用时返回 null，邮件按原样发送。
-      const aiHtml = await generateAlertInterpretation(env, subscription, newAlerts);
-      await sendAlertEmail(env, subscription, newAlerts, undefined, aiHtml);
+      // 内部永不 throw：历史信号 / AI 不可用时返回 null，邮件按原样发送。
+      const signalContext = await buildSignalContext(env, newAlerts, subscription.period);
+      const signalHtml = renderSignalContextHtml(signalContext, newAlerts);
+      const aiHtml = await generateAlertInterpretation(env, subscription, newAlerts, signalContext);
+      await sendAlertEmail(env, subscription, newAlerts, undefined, aiHtml, signalHtml);
       const nextKeys = [...sentKeys, ...newAlerts.map((alert) => alert.alertKey)].slice(-300);
       subscription.lastAlertKeys = nextKeys;
       subscription.lastAlertAt = new Date().toISOString();
@@ -1258,6 +1261,9 @@ export default {
       }
       if (url.pathname === "/api/snapshot-history" && request.method === "GET") {
         return await handleSnapshotHistory(request, env);
+      }
+      if (url.pathname === "/api/signal-context" && request.method === "GET") {
+        return await handleSignalContext(request, env);
       }
       if (url.pathname === "/api/snapshot-run" && request.method === "POST") {
         if (!env.ALERT_SECRET || request.headers.get("Authorization") !== `Bearer ${env.ALERT_SECRET}`) {

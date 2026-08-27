@@ -8,7 +8,7 @@ const scriptName = process.env.CLOUDFLARE_WORKER_SCRIPT || "boll-alert-subscript
 const kvTitle = process.env.CLOUDFLARE_KV_TITLE || "boll_alert_subscriptions";
 const workerFile = "subscription-worker.js";
 // 主模块之外还需要一并上传的 ES module（Worker 侧以相对路径 import）。
-const extraModuleFiles = ["ai-interpreter.js", "snapshot-store.js"];
+const extraModuleFiles = ["ai-interpreter.js", "snapshot-store.js", "signal-context.js"];
 const d1DatabaseName = process.env.CLOUDFLARE_D1_DATABASE || "boll_snapshots";
 // 整体回滚开关：DISABLE_D1=1 时不建库、不加 binding，Worker 侧因 env.DB 缺失自动全 no-op。
 const disableD1 = process.env.DISABLE_D1 === "1";
