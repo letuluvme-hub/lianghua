@@ -32,7 +32,8 @@ const SYSTEM_PROMPT = `你是一名量化技术分析助手，为个人投资者
 - 每只触发股票 2-3 句：说明触发的技术含义（突破方向、偏离程度、结合近20日走势的位置，如带宽收窄/放大、是否连续多日触及轨道）。
 - 最后 1 段（1-2 句）：若多只股票同时触发，指出共性；只有一只则给出后续值得关注的技术位。
 - 只做技术面客观描述，不预测涨跌，不给出买入/卖出建议，不使用"建议""看好""看空"等措辞。
-- 全文不超过 300 字。`;
+- 全文不超过 300 字。
+- 输入可能附带历史派生信号（streakDays 连续触轨天数、bandwidthChg5d 带宽5日变化、bandwidthPctile120/sigmaPctile250 分位）；提供了就必须在解读中引用它们，说明当前触发在历史中的位置。`;
 
 // FNV-1a 32 位，够用的短哈希（不引依赖）。
 function shortHash(input) {
@@ -61,27 +62,46 @@ function round(value, digits = 3) {
   return Number.isFinite(Number(value)) ? Number(Number(value).toFixed(digits)) : null;
 }
 
-function buildUserPrompt(subscription, alerts) {
+// signalContext（signal-context.js 的产出）为 null、或该 code 没有条目时，
+// alert 条目里整体省略 signal 字段，请求体与未接入本模块时逐字节一致。
+function signalFor(signalContext, code) {
+  const entry = signalContext?.byCode?.[code];
+  if (!entry) return null;
+  return {
+    asOf: entry.asOf,
+    streakDays: entry.streakDays,
+    bandwidthChg5d: round(entry.bandwidthChg5d),
+    bandwidthPctile120: round(entry.bandwidthPctile120),
+    sigmaPctile250: round(entry.sigmaPctile250),
+    dataDays: entry.dataDays,
+  };
+}
+
+function buildUserPrompt(subscription, alerts, signalContext = null) {
   const payload = {
     rule: {
       period: subscription?.period ?? null,
       multiplier: subscription?.multiplier ?? null,
       condition: subscription?.condition ?? null,
     },
-    alerts: alerts.map((alert) => ({
-      name: alert.name,
-      code: alert.code,
-      date: alert.date,
-      close: round(alert.close),
-      middle: round(alert.middle),
-      standardDeviation: round(alert.standardDeviation),
-      side: alert.side,
-      boundary: round(alert.boundary),
-      sigmaOffset: round(alert.sigmaOffset),
-      recentCloses: Array.isArray(alert.recentCloses)
-        ? alert.recentCloses.map((row) => ({ date: row.date, close: round(row.close) }))
-        : [],
-    })),
+    alerts: alerts.map((alert) => {
+      const signal = signalFor(signalContext, alert.code);
+      return {
+        name: alert.name,
+        code: alert.code,
+        date: alert.date,
+        close: round(alert.close),
+        middle: round(alert.middle),
+        standardDeviation: round(alert.standardDeviation),
+        side: alert.side,
+        boundary: round(alert.boundary),
+        sigmaOffset: round(alert.sigmaOffset),
+        recentCloses: Array.isArray(alert.recentCloses)
+          ? alert.recentCloses.map((row) => ({ date: row.date, close: round(row.close) }))
+          : [],
+        ...(signal ? { signal } : {}),
+      };
+    }),
   };
   return JSON.stringify(payload);
 }
@@ -220,8 +240,8 @@ function anthropicProvider(env) {
   };
 }
 
-async function requestInterpretation(provider, subscription, alerts) {
-  const { url, init } = provider.buildRequest(buildUserPrompt(subscription, alerts));
+async function requestInterpretation(provider, subscription, alerts, signalContext) {
+  const { url, init } = provider.buildRequest(buildUserPrompt(subscription, alerts, signalContext));
   const response = await fetch(url, { ...init, signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) });
 
   if (!response.ok) {
@@ -240,7 +260,7 @@ async function requestInterpretation(provider, subscription, alerts) {
  * 生成预警邮件的 AI 解读 HTML 片段。
  * @returns {Promise<string|null>} HTML 片段；null 表示无解读，邮件按原样发送。
  */
-export async function generateAlertInterpretation(env, subscription, alerts) {
+export async function generateAlertInterpretation(env, subscription, alerts, signalContext = null) {
   try {
     if (!Array.isArray(alerts) || alerts.length === 0) return null;
     const provider = pickProvider(env);
@@ -254,7 +274,7 @@ export async function generateAlertInterpretation(env, subscription, alerts) {
     });
     if (cached) return cached;
 
-    const html = await requestInterpretation(provider, subscription, alerts);
+    const html = await requestInterpretation(provider, subscription, alerts, signalContext);
     if (!html) return null;
 
     await env.SUBSCRIPTIONS?.put(cacheKey, html, { expirationTtl: CACHE_TTL_SECONDS }).catch((err) => {
