@@ -1,3 +1,4 @@
+import { listSubscriptionRecords } from "./subscription-store.js";
 // 每日指标快照落库模块（独立、可选、失败即降级）。
 //
 // 设计约束（与 ai-interpreter.js 同源）：
@@ -6,7 +7,7 @@
 //    以保证「新模块任何情况下不影响现有功能」——主 Worker 只多 5 个挂钩点。
 // 2. 三个导出永不 throw：任何异常路径都吞掉并记 warn，调用方拿到 null/undefined。
 // 3. 未绑定 D1（env.DB 缺失）时整体关闭：不建表、不拉数据、不写 KV，零成本，
-//    行为与未接入本模块时逐字节一致。这也是整体回滚路径（部署时 DISABLE_D1=1）。
+//    仅适用于旧版可选快照模式；D1 订阅启用后不能移除 DB 作为整体回滚。
 
 const MAX_UNIVERSE = 200; // 单次快照最多覆盖多少只股票（超出截断并 warn）
 const FETCH_TIMEOUT_MS = 15_000; // 单次行情请求超时（毫秒）
@@ -414,8 +415,8 @@ async function collectUniverse(env) {
   };
 
   if (env.SUBSCRIPTIONS) {
-    for (const prefix of ["sub:", "alert:"]) {
-      for (const record of await listKvValues(env, prefix)) {
+    for (const kind of ["daily", "alert"]) {
+      for (const record of await listSubscriptionRecords(env, kind)) {
         for (const code of Array.isArray(record.stocks) ? record.stocks : []) push(code);
         const period = normalizePeriod(record.period);
         if (period) periods.add(period);
@@ -747,3 +748,6 @@ export async function handleSnapshotHistory(request, env) {
     return jsonResponse({ error: "查询失败" }, 500);
   }
 }
+
+
+export { collectUniverse };

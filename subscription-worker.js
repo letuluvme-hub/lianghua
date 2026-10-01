@@ -1,3 +1,8 @@
+import {
+  storageMode, assertSubscriptionOperation, readSubscription, writeSubscription,
+  deleteSubscription, listSubscriptionRecords, acquireDelivery, prepareDelivery,
+  isDeliveryCurrent, completeDelivery, releaseDelivery,
+} from "./subscription-store.js";
 import { generateAlertInterpretation } from "./ai-interpreter.js";
 import { runDailySnapshot, persistSectorSnapshot, handleSnapshotHistory } from "./snapshot-store.js";
 import { buildSignalContext, renderSignalContextHtml, handleSignalContext } from "./signal-context.js";
@@ -743,7 +748,7 @@ function renderEmail(subscription, snapshots) {
   `;
 }
 
-async function sendResendEmail(env, to, subject, html) {
+async function sendResendEmail(env, to, subject, html, delivery = null) {
   if (!env.RESEND_API_KEY || !env.RESEND_FROM_EMAIL) {
     throw new Error("Missing RESEND_API_KEY or RESEND_FROM_EMAIL");
   }
@@ -752,7 +757,9 @@ async function sendResendEmail(env, to, subject, html) {
     headers: {
       Authorization: `Bearer ${env.RESEND_API_KEY}`,
       "Content-Type": "application/json",
+      ...(delivery?.idempotencyKey ? { "Idempotency-Key": delivery.idempotencyKey } : {}),
     },
+    ...(delivery ? { signal: AbortSignal.timeout(FETCH_TIMEOUT_MS), redirect: "error" } : {}),
     body: JSON.stringify({
       from: env.RESEND_FROM_EMAIL,
       to,
@@ -789,14 +796,14 @@ async function readWatchlist(env, email) {
 }
 
 async function getUserState(env, email) {
-  const [watchlist, dailyRaw, alertRaw] = await Promise.all([
+  const [watchlist, dailyRecord, alertRecord] = await Promise.all([
     readWatchlist(env, email),
-    env.SUBSCRIPTIONS.get(`sub:${email}`),
-    env.SUBSCRIPTIONS.get(`alert:${email}`),
+    readSubscription(env, "daily", email),
+    readSubscription(env, "alert", email),
   ]);
   const [daily, alert] = await Promise.all([
-    dailyRaw ? publicSubscription(safeJsonParse(dailyRaw)) : null,
-    alertRaw ? publicAlertSubscription(safeJsonParse(alertRaw)) : null,
+    dailyRecord ? publicSubscription(dailyRecord) : null,
+    alertRecord ? publicAlertSubscription(alertRecord) : null,
   ]);
   return {
     email,
@@ -903,8 +910,8 @@ async function handleWatchlist(request, env) {
   return json({ ok: true, email: user.email, watchlist: await readWatchlist(env, user.email) });
 }
 
-async function sendEmail(env, subscription, snapshots, subjectPrefix = "日布林带推送") {
-  return sendResendEmail(env, subscription.email, `${subjectPrefix} ${currentShanghaiParts().date}`, renderEmail(subscription, snapshots));
+async function sendEmail(env, subscription, snapshots, subjectPrefix = "日布林带推送", delivery = null) {
+  return sendResendEmail(env, subscription.email, `${subjectPrefix} ${currentShanghaiParts().date}`, renderEmail(subscription, snapshots), delivery);
 }
 
 function evaluateAlert(snapshot, subscription) {
@@ -1003,11 +1010,12 @@ function renderAlertConfirmationEmail(subscription, snapshots) {
   `;
 }
 
-async function sendAlertEmail(env, subscription, alerts, subjectPrefix = "日布林带预警", aiHtml = null, signalHtml = null) {
-  return sendResendEmail(env, subscription.email, `${subjectPrefix} ${currentShanghaiParts().date}`, renderAlertEmail(subscription, alerts, aiHtml, signalHtml));
+async function sendAlertEmail(env, subscription, alerts, subjectPrefix = "日布林带预警", aiHtml = null, signalHtml = null, delivery = null) {
+  return sendResendEmail(env, subscription.email, `${subjectPrefix} ${currentShanghaiParts().date}`, renderAlertEmail(subscription, alerts, aiHtml, signalHtml), delivery);
 }
 
 async function handleSubscribe(request, env) {
+  await assertSubscriptionOperation(env, "mutation");
   const body = await request.json().catch(() => null);
   const user = getBearerToken(request) ? await requireUser(request, env) : null;
   if (user?.response) return user.response;
@@ -1023,8 +1031,8 @@ async function handleSubscribe(request, env) {
   if (!period) return json({ error: "周期 N 需要是 2 到 250 之间的整数。" }, 400);
 
   // 重新提交订阅时保留 lastSentDate，避免“当天已推送过 + 立刻又在 sendTime 重复推送”。
-  const previous = safeJsonParse(await env.SUBSCRIPTIONS.get(`sub:${email}`));
-  const subscription = {
+  const previous = await readSubscription(env, "daily", email);
+  let subscription = {
     email,
     sendTime,
     stocks,
@@ -1034,7 +1042,7 @@ async function handleSubscribe(request, env) {
     updatedAt: new Date().toISOString(),
     lastSentDate: previous?.lastSentDate || null,
   };
-  await env.SUBSCRIPTIONS.put(`sub:${email}`, JSON.stringify(subscription));
+  subscription = await writeSubscription(env, "daily", subscription);
 
   const snapshots = await mapWithConcurrency(stocks, 4, (code) => fetchStockSnapshot(code, period));
   await sendEmail(env, subscription, snapshots, "订阅成功：日布林带推送已开启");
@@ -1043,6 +1051,7 @@ async function handleSubscribe(request, env) {
 }
 
 async function handleAlertSubscribe(request, env) {
+  await assertSubscriptionOperation(env, "mutation");
   const body = await request.json().catch(() => null);
   const user = getBearerToken(request) ? await requireUser(request, env) : null;
   if (user?.response) return user.response;
@@ -1061,8 +1070,8 @@ async function handleAlertSubscribe(request, env) {
 
   // 重新提交订阅时继承已发送的 alertKey（key 内含日期/规则，旧规则的 key 不影响新规则），
   // 否则重新保存订阅会重置去重集合，同一交易日会重复发送已发过的预警。
-  const previous = safeJsonParse(await env.SUBSCRIPTIONS.get(`alert:${email}`));
-  const subscription = {
+  const previous = await readSubscription(env, "alert", email);
+  let subscription = {
     email,
     stocks,
     period,
@@ -1073,7 +1082,7 @@ async function handleAlertSubscribe(request, env) {
     lastAlertKeys: Array.isArray(previous?.lastAlertKeys) ? previous.lastAlertKeys : [],
     lastAlertAt: previous?.lastAlertAt || null,
   };
-  await env.SUBSCRIPTIONS.put(`alert:${email}`, JSON.stringify(subscription));
+  subscription = await writeSubscription(env, "alert", subscription);
 
   const snapshots = await mapWithConcurrency(stocks, 4, (code) => fetchStockSnapshot(code, period));
   await sendResendEmail(
@@ -1122,6 +1131,7 @@ async function handleSubscriptions(request, env) {
 }
 
 async function handleUnsubscribe(request, env) {
+  await assertSubscriptionOperation(env, "mutation");
   const user = await requireUser(request, env);
   if (user.response) return user.response;
 
@@ -1135,8 +1145,8 @@ async function handleUnsubscribe(request, env) {
   if (type === "daily" || type === "all") targets.push({ type: "daily", key: `sub:${email}` });
   if (type === "alert" || type === "all") targets.push({ type: "alert", key: `alert:${email}` });
 
-  const before = await Promise.all(targets.map((target) => env.SUBSCRIPTIONS.get(target.key)));
-  await Promise.all(targets.map((target) => env.SUBSCRIPTIONS.delete(target.key)));
+  const before = await Promise.all(targets.map((target) => readSubscription(env, target.type, email)));
+  await Promise.all(targets.map((target) => deleteSubscription(env, target.type, email)));
 
   const state = await getUserState(env, email);
 
@@ -1148,61 +1158,70 @@ async function handleUnsubscribe(request, env) {
   });
 }
 
+// An unknown provider outcome deliberately leaves a persisted sending attempt.
+// Never reopen that claim automatically: reconciliation is required before retrying.
+async function finishUnsentDelivery(env, kind, subscription, claim, prepared) {
+  if (!claim) return;
+  try {
+    await releaseDelivery(env, kind, subscription, claim, { unsent: prepared });
+  } catch (err) {
+    console.error("[subscription] claim release failed", { code: err?.code || "release_failed" });
+  }
+}
+
 async function sendDueSubscriptions(env, force = false) {
+  await assertSubscriptionOperation(env, "dispatch");
   const now = currentShanghaiParts();
-  const list = await env.SUBSCRIPTIONS.list({ prefix: "sub:" });
+  const subscriptions = await listSubscriptionRecords(env, "daily", force ? {} : { sendTime: now.time });
   const results = [];
-
-  for (const key of list.keys) {
-    // 单个订阅（或其中一只股票）失败不应中断整个批次，否则后面的订阅者全部收不到邮件。
+  for (const subscription of subscriptions) {
+    if (!subscription?.email || !Array.isArray(subscription.stocks)) continue;
+    if (!force && subscription.sendTime !== now.time) continue;
+    if (!force && subscription.lastSentDate === now.date) continue;
+    let claim = null, prepared = false, attempted = false;
     try {
-      const subscription = safeJsonParse(await env.SUBSCRIPTIONS.get(key.name));
-      if (!subscription?.email || !Array.isArray(subscription.stocks)) continue;
-      if (!force && subscription.sendTime !== now.time) continue;
-      if (!force && subscription.lastSentDate === now.date) continue;
-
-      const snapshots = (
-        await mapWithConcurrency(subscription.stocks, 4, (code) =>
-          fetchStockSnapshot(code, subscription.period).catch((err) => {
-            console.warn(`[daily] snapshot failed ${code}:`, err?.message || err);
-            return null;
-          })
-        )
-      ).filter(Boolean);
+      claim = await acquireDelivery(env, "daily", subscription);
+      if (!claim) continue;
+      const snapshots = (await mapWithConcurrency(subscription.stocks, 4, (code) =>
+        fetchStockSnapshot(code, subscription.period).catch(() => null)
+      )).filter(Boolean);
       if (snapshots.length === 0) {
         results.push({ email: subscription.email, count: 0, error: "所有股票行情拉取失败，本次跳过" });
         continue;
       }
-      await sendEmail(env, subscription, snapshots);
-      subscription.lastSentDate = now.date;
-      await env.SUBSCRIPTIONS.put(key.name, JSON.stringify(subscription));
+      const state = { lastSentDate: now.date };
+      prepared = await prepareDelivery(env, "daily", subscription, claim, state);
+      if (!prepared || !await isDeliveryCurrent(env, "daily", subscription, claim)) continue;
+      attempted = true;
+      await sendEmail(env, subscription, snapshots, undefined,
+        storageMode(env) === "d1" ? claim : null);
+      if (!await completeDelivery(env, "daily", subscription, claim, state)) {
+        throw new Error("delivery_state_conflict");
+      }
       results.push({ email: subscription.email, count: snapshots.length });
     } catch (err) {
-      console.error(`[daily] ${key.name} failed:`, err?.message || err);
-      results.push({ key: key.name, error: err?.message || String(err) });
+      console.error("[daily] delivery failed", { code: err?.code || "dispatch_failed", attempted });
+      results.push({ email: subscription.email, error: "推送未完成，请检查服务状态。" });
+    } finally {
+      if (!attempted) await finishUnsentDelivery(env, "daily", subscription, claim, prepared);
     }
   }
-
   return results;
 }
 
 async function sendDueAlerts(env, force = false) {
-  const list = await env.SUBSCRIPTIONS.list({ prefix: "alert:" });
+  await assertSubscriptionOperation(env, "dispatch");
+  const subscriptions = await listSubscriptionRecords(env, "alert");
   const results = [];
-
-  for (const key of list.keys) {
-    // 单个订阅（或其中一只股票）失败不应中断整个批次。
+  for (const subscription of subscriptions) {
+    if (!subscription?.email || !Array.isArray(subscription.stocks)) continue;
+    let claim = null, prepared = false, attempted = false;
     try {
-      const subscription = safeJsonParse(await env.SUBSCRIPTIONS.get(key.name));
-      if (!subscription?.email || !Array.isArray(subscription.stocks)) continue;
-      const snapshots = (
-        await mapWithConcurrency(subscription.stocks, 4, (code) =>
-          fetchStockSnapshot(code, subscription.period).catch((err) => {
-            console.warn(`[alert] snapshot failed ${code}:`, err?.message || err);
-            return null;
-          })
-        )
-      ).filter(Boolean);
+      // Most minute checks produce no new alert. Keep those checks read-only;
+      // leasing every idle subscriber would create 2,880 D1 writes/day each.
+      const snapshots = (await mapWithConcurrency(subscription.stocks, 4, (code) =>
+        fetchStockSnapshot(code, subscription.period).catch(() => null)
+      )).filter(Boolean);
       const sentKeys = new Set(subscription.lastAlertKeys || []);
       const alerts = snapshots.map((snapshot) => evaluateAlert(snapshot, subscription)).filter(Boolean);
       const newAlerts = force ? alerts : alerts.filter((alert) => !sentKeys.has(alert.alertKey));
@@ -1210,23 +1229,28 @@ async function sendDueAlerts(env, force = false) {
         results.push({ email: subscription.email, checked: snapshots.length, sent: 0 });
         continue;
       }
-
-      // 内部永不 throw：历史信号 / AI 不可用时返回 null，邮件按原样发送。
+      claim = await acquireDelivery(env, "alert", subscription);
+      if (!claim) continue;
       const signalContext = await buildSignalContext(env, newAlerts, subscription.period);
       const signalHtml = renderSignalContextHtml(signalContext, newAlerts);
       const aiHtml = await generateAlertInterpretation(env, subscription, newAlerts, signalContext);
-      await sendAlertEmail(env, subscription, newAlerts, undefined, aiHtml, signalHtml);
-      const nextKeys = [...sentKeys, ...newAlerts.map((alert) => alert.alertKey)].slice(-300);
-      subscription.lastAlertKeys = nextKeys;
-      subscription.lastAlertAt = new Date().toISOString();
-      await env.SUBSCRIPTIONS.put(key.name, JSON.stringify(subscription));
+      const state = { alertKeys: [...sentKeys, ...newAlerts.map((alert) => alert.alertKey)].slice(-300), lastAlertAt: new Date().toISOString() };
+      prepared = await prepareDelivery(env, "alert", subscription, claim, state);
+      if (!prepared || !await isDeliveryCurrent(env, "alert", subscription, claim)) continue;
+      attempted = true;
+      await sendAlertEmail(env, subscription, newAlerts, undefined, aiHtml, signalHtml,
+        storageMode(env) === "d1" ? claim : null);
+      if (!await completeDelivery(env, "alert", subscription, claim, state)) {
+        throw new Error("delivery_state_conflict");
+      }
       results.push({ email: subscription.email, checked: snapshots.length, sent: newAlerts.length });
     } catch (err) {
-      console.error(`[alert] ${key.name} failed:`, err?.message || err);
-      results.push({ key: key.name, error: err?.message || String(err) });
+      console.error("[alert] delivery failed", { code: err?.code || "dispatch_failed", attempted });
+      results.push({ email: subscription.email, error: "预警未完成，请检查服务状态。" });
+    } finally {
+      if (!attempted) await finishUnsentDelivery(env, "alert", subscription, claim, prepared);
     }
   }
-
   return results;
 }
 
@@ -1283,6 +1307,7 @@ export default {
       }
       return json({ error: "Not found" }, 404);
     } catch (err) {
+      if (err?.name === "SubscriptionStorageError") return json({ error: "订阅服务正在维护，请稍后再试。", code: err.code }, 503);
       return json({ error: err.message || "Worker error" }, 500);
     }
   },
@@ -1620,3 +1645,7 @@ async function handleSectorList(env) {
   if (cached?.boards?.length) return json(cached); // 拉取失败：回退过期缓存
   return json({ savedAt: new Date().toISOString(), savedDate: today, boards: [] });
 }
+
+
+// Named exports support offline scheduler regression tests; no new HTTP routes.
+export { sendDueSubscriptions, sendDueAlerts, currentShanghaiParts };

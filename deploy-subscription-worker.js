@@ -8,9 +8,9 @@ const scriptName = process.env.CLOUDFLARE_WORKER_SCRIPT || "boll-alert-subscript
 const kvTitle = process.env.CLOUDFLARE_KV_TITLE || "boll_alert_subscriptions";
 const workerFile = "subscription-worker.js";
 // 主模块之外还需要一并上传的 ES module（Worker 侧以相对路径 import）。
-const extraModuleFiles = ["ai-interpreter.js", "snapshot-store.js", "signal-context.js"];
+const extraModuleFiles = ["ai-interpreter.js", "snapshot-store.js", "signal-context.js", "subscription-store.js"];
 const d1DatabaseName = process.env.CLOUDFLARE_D1_DATABASE || "boll_snapshots";
-// 整体回滚开关：DISABLE_D1=1 时不建库、不加 binding，Worker 侧因 env.DB 缺失自动全 no-op。
+// 仅旧版可选快照模式可用此开关；D1 订阅启用后禁止移除 DB，见受控回滚手册。
 const disableD1 = process.env.DISABLE_D1 === "1";
 
 async function api(pathname, options = {}) {
@@ -106,6 +106,22 @@ async function uploadWorker(namespaceId, d1DatabaseId) {
   pushSecret("ANTHROPIC_API_KEY", process.env.ANTHROPIC_API_KEY);
   pushSecret("ANTHROPIC_MODEL", process.env.ANTHROPIC_MODEL);
   pushSecret("AI_PROVIDER", process.env.AI_PROVIDER);
+  // Storage-mode changes are an explicit, separately reviewed cutover. Never drop an
+  // existing mode binding during an ordinary deployment or silently remove its DB.
+  const storageMode = process.env.SUBSCRIPTION_STORAGE_MODE;
+  if (storageMode && !["legacy", "handover", "d1"].includes(storageMode)) {
+    throw new Error("SUBSCRIPTION_STORAGE_MODE must be legacy, handover, or d1");
+  }
+  if (disableD1 && (storageMode && storageMode !== "legacy" || existingBindingNames?.has("SUBSCRIPTION_STORAGE_MODE"))) {
+    throw new Error("Refusing to remove D1 from a subscription-storage deployment; use the controlled rollback runbook");
+  }
+  if (storageMode) {
+    bindings.push({ type: "plain_text", name: "SUBSCRIPTION_STORAGE_MODE", text: storageMode });
+  } else if (existingBindingNames?.has("SUBSCRIPTION_STORAGE_MODE")) {
+    bindings.push({ type: "inherit", name: "SUBSCRIPTION_STORAGE_MODE" });
+  } else if (existingBindingNames === null) {
+    throw new Error("Cannot verify existing storage mode; refusing to overwrite deployment bindings");
+  }
   const metadata = {
     main_module: workerFile,
     compatibility_date: "2026-05-23",
@@ -205,3 +221,4 @@ main().catch((error) => {
   console.error(error.message);
   process.exitCode = 1;
 });
+
