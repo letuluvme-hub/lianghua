@@ -1,6 +1,30 @@
 # 订阅 KV LIST 额度修复：验收与受控切换
 
-状态：**代码草稿，尚未部署、建表、迁移或切换**。
+## 2026-10-02 更新：量化任务明确暂停，保留网站和全部数据
+
+**本节覆盖下文所有“保留每分钟 cron”“恢复调度”“清理并激活”的历史步骤。** 当前允许部署修复代码，未授权恢复量化、删除旧副本或完成 D1 切换。实际是否已部署应以现场核验记录为准。
+
+当前部署目标：
+
+- 已有 Worker、网站、KV、D1、订阅及历史数据全部保留，不新建替代资源
+- `SUBSCRIPTION_STORAGE_MODE=handover`：订阅读取沿用现有 KV，订阅新增、更改、取消及分发暂停
+- `QUANT_AUTOMATION_PAUSED=1`：运行时拒绝定时任务和管理端强制发送/快照调用；保留网站读取接口
+- cron 保持已明确停用后的空列表，不自动恢复；确认旧请求/调度已排空，不能只等一个固定秒数就宣布停止
+- 此次休眠部署无需建表、导入、清理或 `ready=1`；不运行本手册下面的迁移/激活命令
+
+先只读核验在线存储仍是 legacy。若 D1 已经启用，不得切回读旧 KV 的 handover；须停下核对当前权威数据源。
+
+部署脚本现仅更新已存在且与在线绑定一致的资源：缺失/未知资源或绑定即停止，不创建 KV/D1，不移除 DB，不更改网站公开状态。它只读核验部署前后 cron，完全不写 schedules，空列表会保持为空。上传强制使用 `bindings_inherit=strict`，无法继承任何已有绑定时整次上传失败，不静默删除绑定。保留并在部署后核对已有 compatibility date/flags、日志与可观测性、placement、limits、usage model、tags 和 tail consumers。发现非空 assets/exports/cache_options 等此路径不能安全处理的配置时，上传前拒绝继续；不静默移除配置。D1 绑定兼容 database_id 与旧 id，两者冲突即停止。暂停标记和其他已有绑定默认继承；仅允许显式设置 `QUANT_AUTOMATION_PAUSED=1`，不提供恢复或清空暂停标记的参数。若部署后调度出现并发变化，脚本报错并要求检查，不把上传成功当作停用成功。
+
+首次停用 cron 是单独核准的运行操作；脚本“保留调度”本身不会替操作者把仍存在的调度清空。后续发布同样必须保留暂停。不得调用强制发送或快照路由做上线测试，也不要创建真实测试订阅发送邮件。验收以模块一致性、暂停绑定、空 cron、网站健康/读取可用及暂停路径为准。
+
+只有用户未来明确要求恢复后，才重新评估排空、迁移、旧副本保留/清理和激活；当前不可弱化 readiness 门禁以跳过清理。
+
+---
+
+以下为 2026-10-01 的历史 D1 切换设计，当前不得直接执行其中与暂停要求冲突的步骤。
+
+状态：**D1 切换方案；本次暂停部署不执行建表、迁移或激活**。
 
 ## 已证实的故障
 
@@ -51,7 +75,7 @@
 Node.js 24（内置 `node:sqlite`），不需要 npm 安装或网络：
 
 ```sh
-node --test tests/subscription-store.test.mjs tests/subscription-scheduler.test.mjs tests/subscription-import-cli.test.mjs
+node --test tests/subscription-store.test.mjs tests/subscription-scheduler.test.mjs tests/subscription-import-cli.test.mjs tests/subscription-deployment.test.mjs
 node --check subscription-worker.js
 node --check subscription-store.js
 node --check snapshot-store.js

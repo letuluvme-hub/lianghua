@@ -149,3 +149,52 @@ test('idle intraday alert scans perform zero D1 writes, avoiding a replacement q
   assert.equal(env.DB.calls.filter(x=>/^\s*(INSERT|UPDATE|DELETE)/i.test(x.sql??'')).length,0);
   assert.equal(env.SUBSCRIPTIONS.calls.length,0);
 });
+
+test('paused scheduled events do no work for a full day, including the snapshot window', async t => {
+  clock(t); const net=networking(t);
+  const env={SUBSCRIPTION_STORAGE_MODE:'handover',QUANT_AUTOMATION_PAUSED:'1',SUBSCRIPTIONS:createKV()};
+  let waits=0;
+  const ctx={waitUntil(){waits++;}};
+  const start=Date.parse('2026-10-01T16:00:00Z');
+  for(let n=0;n<1440;n++){
+    t.mock.timers.setTime(start+n*60_000);
+    await worker.scheduled({},env,ctx);
+  }
+  assert.equal(waits,0); assert.equal(net.quotes,0);assert.equal(net.mails.length,0);
+  assert.equal(env.SUBSCRIPTIONS.calls.length,0);
+});
+
+test('paused API blocks all subscription changes and admin dispatch without data writes', async t => {
+  clock(t);const net=networking(t);
+  const env={SUBSCRIPTION_STORAGE_MODE:'handover',QUANT_AUTOMATION_PAUSED:'1',SUBSCRIPTIONS:createKV()};
+  for(const path of ['/api/subscribe','/api/subscribe-alert','/api/unsubscribe','/api/send-daily','/api/send-alerts','/api/snapshot-run']){
+    const response=await worker.fetch(new Request('https://example.test'+path,{method:'POST',body:'{}'}),env);
+    assert.equal(response.status,503,path);
+    assert.ok(['SUBSCRIPTION_HANDOVER','QUANT_AUTOMATION_PAUSED'].includes((await response.json()).code));
+  }
+  assert.equal((await worker.fetch(new Request('https://example.test/api/health'),env)).status,200);
+  assert.equal((await worker.fetch(new Request('https://example.test/api/subscriptions'),env)).status,401);
+  assert.equal(env.SUBSCRIPTIONS.calls.length,0);assert.equal(net.quotes,0);assert.equal(net.mails.length,0);
+});
+
+test('paused storage keeps existing subscriptions readable without D1 schema or mutation',async t=>{
+  clock(t);const net=networking(t);
+  const env={SUBSCRIPTION_STORAGE_MODE:'handover',QUANT_AUTOMATION_PAUSED:'1',SUBSCRIPTIONS:createKV([['sub:'+email,daily()],['alert:'+email,alert()]])};
+  assert.deepEqual(await readSubscription(env,'daily',email),daily());
+  assert.deepEqual(await readSubscription(env,'alert',email),alert());
+  assert.equal(env.SUBSCRIPTIONS.calls.filter(x=>x.type!=='get').length,0);
+  assert.equal(net.quotes,0);assert.equal(net.mails.length,0);
+});
+
+test('paused public subscription reader returns the existing records for an authenticated user',async t=>{
+  clock(t);const net=networking(t);
+  const env={SUBSCRIPTION_STORAGE_MODE:'handover',QUANT_AUTOMATION_PAUSED:'1',SUBSCRIPTIONS:createKV([
+    ['session:valid-test-session',{email,expiresAt:'2026-10-03T00:00:00Z'}],
+    ['watchlist:'+email,{codes:['600036']}],['sub:'+email,daily()],['alert:'+email,alert()]
+  ])};
+  const response=await worker.fetch(new Request('https://example.test/api/subscriptions',{headers:{Authorization:'Bearer valid-test-session'}}),env);
+  assert.equal(response.status,200);
+  const data=await response.json();assert.equal(data.daily.email,email);assert.equal(data.alert.email,email);assert.equal(data.daily.sendTime,'16:00');assert.equal(data.hasAny,true);
+  assert.equal(env.SUBSCRIPTIONS.calls.filter(x=>x.type!=='get').length,0);
+  assert.equal(net.mails.length,0);assert.equal(net.quotes,0);
+});

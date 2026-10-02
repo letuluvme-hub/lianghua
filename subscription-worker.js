@@ -1260,6 +1260,10 @@ export default {
       const url = new URL(request.url);
       if (request.method === "OPTIONS") return json({});
       if (url.pathname === "/api/health") return json({ ok: true });
+      if (env.QUANT_AUTOMATION_PAUSED === "1" && request.method === "POST" &&
+          ["/api/send-daily", "/api/send-alerts", "/api/snapshot-run"].includes(url.pathname)) {
+        return json({ error: "量化自动任务已暂停。", code: "QUANT_AUTOMATION_PAUSED" }, 503);
+      }
       if (url.pathname === "/api/klines" && request.method === "GET") return await klineCache(request, () => handleKlines(request));
       if (url.pathname === "/api/auth/request-code" && request.method === "POST") return await handleRequestLoginCode(request, env);
       if (url.pathname === "/api/auth/verify" && request.method === "POST") return await handleVerifyLogin(request, env);
@@ -1312,6 +1316,9 @@ export default {
     }
   },
   async scheduled(event, env, ctx) {
+    // Keep already queued cron events inert after the requested stop. Deployment
+    // preserves this binding and existing (empty) schedules until explicit resume.
+    if (env.QUANT_AUTOMATION_PAUSED === "1") return;
     const tasks = [sendDueSubscriptions(env), sendDueAlerts(env)];
     if (shouldRefreshPcbNow()) {
       // 每日指标快照落库（独立任务，与板块刷新并列；未绑定 D1 时内部立即返回）
